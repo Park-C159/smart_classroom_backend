@@ -1,8 +1,21 @@
-# 智能学伴 · 后端服务
+# 智能学伴 · 后端服务（Smart Classroom Backend）
 
-基于大模型的数学教材智能答疑系统后端，面向本科生提供智能答疑、学情分析、智能组卷、讨论区、私信与用户管理能力。
+> 面向本科生数学教材的智能答疑系统后端，基于大模型与 RAG（检索增强生成）提供智能答疑、学情分析、智能组卷、讨论区与私信能力。
 
-> 前端仓库见 [smart_classroom_app](https://github.com/Park-C159/smart_classroom_app)。
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
+![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0+-D71F00)
+![License](https://img.shields.io/badge/License-MIT-blue.svg)
+
+配套前端：[smart_classroom_app](https://github.com/Park-C159/smart_classroom_app)
+
+## 简介
+
+智能学伴（Smart Classroom）是一套面向高校数学课程的智能教学辅助系统。本仓库为**后端服务**，负责：
+
+- 将教材 PDF 解析为结构化知识树与题库，构建「知识库 + 题库」双向量索引；
+- 基于 RAG 提供流式智能答疑（支持深度思考与联网搜索）；
+- 支撑学情分析、智能组卷（作业 / 测试 / 考试 / 自测）、讨论区与师生私信。
 
 ## 功能特性
 
@@ -11,7 +24,7 @@
 | 智能答疑（RAG） | 知识库（KB）+ 题库（QB）双向量库，全局检索 → 分别重排 → LLM 流式生成（SSE），支持深度思考与联网搜索 |
 | 教材解析 | PDF 上传 → MinerU 高精度解析 → 知识树 / 分块 / 题目入库 |
 | 知识库管理 | 知识树 CRUD、分块管理、题目（题库）审核与编辑 |
-| 组卷与练习 | 独立试题库 + 按题型组卷（作业 / 测试 / 考试 / 自测练习），逐题判分 |
+| 组卷与练习 | 独立试题库 + 按题型组卷（作业 / 测试 / 考试 / 自测练习），逐题判分，简答题支持 LLM 自动评分 |
 | 学情分析 | 按知识点逐题更新掌握度（EWMA），班级 / 个人学情统计 |
 | 讨论区 & 私信 | 发帖 / 回帖 / 点赞 / 置顶，学生与教师一对一私信 |
 | 语音识别 | Whisper 本地转写（按需加载 / 空闲卸载） |
@@ -75,7 +88,8 @@ backend/
 ├── alembic/                     # 数据库迁移骨架
 ├── requirements.txt
 ├── Dockerfile
-└── .env.example                 # 环境变量模板（无真实密钥）
+├── .env.example                 # 环境变量模板（无真实密钥）
+└── LICENSE
 ```
 
 ## 快速开始
@@ -98,8 +112,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> 依赖中的 `faiss-gpu` 需有 CUDA 环境；无 GPU 请改为 `faiss-cpu`。
-> `torch` 请按官方指引安装与 CUDA 版本匹配的 wheel。
+> - 无 GPU 环境请将 `requirements.txt` 中的 `faiss-gpu` 改为 `faiss-cpu`。
+> - `torch` 请按官方指引安装与 CUDA 版本匹配的 wheel。
 
 ### 3. 配置环境变量
 
@@ -171,15 +185,19 @@ docker run --rm -p 8000:8000 --env-file .env smart-classroom-backend
 | `/api/feedback` | 反馈建议 | 登录 |
 | `/api/upload` | 文件上传 / Excel 批量导入 | 管理员 / 教师 |
 
-## 隐私与安全
+## 贡献指南
 
-1. **密钥不入库**：所有密钥（`DEEPSEEK_API_KEY`、`BAIDU_SEARCH_API_KEY`、`NATAPP_AUTHTOKEN` 等）一律放在 `.env`，已被 `.gitignore` 排除；仓库中仅保留 `.env.example` 模板，值为占位符。
-2. **强密钥**：`config.py` 中 `SECRET_KEY` 的默认值仅用于本地开发，生产环境务必改为强随机字符串并妥善保管。
-3. **用户数据不入库**：`data/`（上传 PDF / 解析结果 / 向量索引）、`output/`（解析产物）、`*.db`（含用户与答题数据）均被 `.gitignore` 排除，请勿强制提交。
-4. **日志不入库**：`*.log` 可能包含请求与提示词内容，已被排除。
-5. **密码安全**：用户密码使用 bcrypt 哈希存储，接口鉴权基于 JWT，接口按 `student / teacher / admin` 三级 RBAC 控制访问。
-6. **提交前自查**：`git add` 后务必 `git status` 确认无 `.env`、`.db`、`data/`、`output/`、`*.log` 被暂存；也可用 `git check-ignore` 校验。
+欢迎提交 Issue 与 Pull Request。
 
-## 许可
+1. Fork 本仓库，克隆到本地；
+2. 新建分支：`git checkout -b feature/your-feature`；
+3. 提交改动，遵循既有代码风格（中文注释、`app/api` 路由 + `app/services` 服务分层）；
+4. 推送到你的 Fork，发起 Pull Request 到 `main` 分支。
 
-本仓库为课程/毕业设计项目，未指定开源许可。引用或复用前请先联系作者。
+## 开源许可
+
+本项目采用 [MIT License](LICENSE)。
+
+## 相关项目
+
+- 前端：[smart_classroom_app](https://github.com/Park-C159/smart_classroom_app)
