@@ -1,0 +1,47 @@
+# ── Web framework ──
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# ── Database ──
+sqlalchemy[asyncio]>=2.0.30
+asyncpg>=0.29.0
+alembic>=1.13.0
+
+# ── Redis ──
+redis>=5.0.0
+
+# ── Auth ──
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.1.0
+
+# ── Settings ──
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.0
+
+# ── Async tasks ──
+celery[redis]>=5.4.0
+
+# ── File processing ──
+openpyxl>=3.1.0
+pandas>=2.2.0
+
+# ── AI/ML (GPU) ──
+torch>=2.3.0
+transformers>=4.40.0
+sentence-transformers>=3.0.0
+faiss-gpu>=1.7.0  # use faiss-cpu if no GPU available
+
+# ── PDF parsing ──
+# mineru>=3.4.0  # uncomment when MinerU is installed
+
+# ── Speech ──
+faster-whisper>=1.0.0
+
+# ── LLM API ──
+openai>=1.30.0  # for DeepSeek API (OpenAI-compatible)
+httpx>=0.27.0
+
+# ── Utilities ──
+python-multipart>=0.0.9
+aiofiles>=23.2.0

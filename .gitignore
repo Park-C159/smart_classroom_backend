@@ -1,0 +1,37 @@
+# ============ 密钥与敏感配置 ============
+.env
+.env.*
+!.env.example
+
+# ============ 数据库（含用户数据，切勿提交）============
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ============ 运行时生成的数据（上传 / 解析 / 向量索引）============
+data/
+output/
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ============ 日志 ============
+*.log
+logs/
+
+# ============ 临时 / 基准脚本 ============
+*.bak
+scripts/benchmark_*.py
+
+# ============ IDE / 系统 ============
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
