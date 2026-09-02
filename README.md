@@ -94,36 +94,63 @@ backend/
 
 ## 快速开始
 
-### 1. 环境要求
+> 以下步骤假设你已经**下载并解压了本仓库的源码压缩包**（或 `git clone` 了本仓库）。
 
-- Python 3.11+
-- （可选）CUDA GPU，用于本地 Embedding / Reranker / MinerU；无 GPU 可改 `CUDA_DEVICE=cpu`
-- （可选）Redis，用于 Celery 异步任务
+### 0. 运行前准备
 
-### 2. 安装依赖
+| 准备项 | 是否必需 | 说明 |
+|--------|:---:|------|
+| Python 3.11+ | ✅ | 命令行执行 `python --version` 检查 |
+| DeepSeek API Key | ✅ | 在 [platform.deepseek.com](https://platform.deepseek.com) 注册并创建 API Key（智能答疑与组卷判分都依赖它） |
+| CUDA GPU | 可选 | 用于本地 Embedding / Reranker / MinerU 加速；没有 GPU 可改用 CPU |
+| Redis | 可选 | 仅 Celery 异步任务需要，不启动任务可不装 |
+
+### 1. 安装依赖
 
 ```bash
+# 进入后端目录
+cd smart_classroom_backend
+
+# 创建并激活虚拟环境
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
-# Linux / macOS
+# macOS / Linux
 source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-> - 无 GPU 环境请将 `requirements.txt` 中的 `faiss-gpu` 改为 `faiss-cpu`。
-> - `torch` 请按官方指引安装与 CUDA 版本匹配的 wheel。
+> - 没有 NVIDIA GPU 时，把 `requirements.txt` 里的 `faiss-gpu` 改为 `faiss-cpu`，再执行安装。
+> - `torch` 建议按 [PyTorch 官网](https://pytorch.org/get-started/locally/) 指引，安装与你的 CUDA 版本匹配的 wheel。
 
-### 3. 配置环境变量
+### 2. 配置环境变量（密钥 / 隐私保护）
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env`，填入真实密钥（详见下方「环境变量说明」）。**`.env` 已被 `.gitignore` 忽略，切勿提交到仓库。**
+编辑 `.env`，至少修改下面两项：
 
-### 4. 启动服务
+```ini
+# JWT 签名密钥 —— 务必改成强随机值，不要用默认值
+SECRET_KEY=用下面的命令生成一段
+
+# 你的 DeepSeek API Key
+DEEPSEEK_API_KEY=sk-你的真实key
+```
+
+生成强随机 `SECRET_KEY`：
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+其余变量（百度搜索 Key、内网穿透 token、MinerU 路径等）按需填写，不用的留空即可。详见下方「环境变量说明」。
+
+> ⚠️ **`.env` 是你的私密文件**，包含真实密钥，请勿提交到 Git、勿上传到任何公开平台、勿发给他人。
+
+### 3. 启动服务
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
@@ -134,9 +161,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - 接口文档（Swagger）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/api/health`
 
-> 首次启动会自动 `create_all` 建表，并加载 RAG 模型（Embedding + Reranker）。
+> 首次启动会自动建表，并加载 RAG 模型（Embedding + Reranker），第一次启动会稍慢，属正常现象。
 
-### 5. Docker 部署
+### 4. Docker 部署（可选）
 
 ```bash
 docker build -t smart-classroom-backend .
@@ -147,7 +174,7 @@ docker run --rm -p 8000:8000 --env-file .env smart-classroom-backend
 
 | 变量 | 必填 | 说明 |
 |------|:---:|------|
-| `SECRET_KEY` | ✅ | JWT 签名密钥，生产环境必须改为强随机值 |
+| `SECRET_KEY` | ✅ | JWT 签名密钥，**必须改为强随机值** |
 | `DEEPSEEK_API_KEY` | ✅ | DeepSeek 开放平台 API Key |
 | `DEEPSEEK_BASE_URL` | - | DeepSeek API 地址，默认 `https://api.deepseek.com/v1` |
 | `DEEPSEEK_CHAT_MODEL` | - | 对话模型，默认 `deepseek-v4-pro` |
@@ -184,6 +211,14 @@ docker run --rm -p 8000:8000 --env-file .env smart-classroom-backend
 | `/api/speech` | 语音转写 | 登录 |
 | `/api/feedback` | 反馈建议 | 登录 |
 | `/api/upload` | 文件上传 / Excel 批量导入 | 管理员 / 教师 |
+
+## 隐私与安全
+
+1. **密钥只放在 `.env`**：所有 API Key（DeepSeek、百度搜索、natapp 等）都在 `.env` 中配置，源码里不含真实密钥；`.env` 已被 `.gitignore` 忽略，不会随代码上传。
+2. **修改 `SECRET_KEY`**：`config.py` 里给的是占位默认值，部署前务必在 `.env` 里改成强随机值，否则 JWT 可被伪造。
+3. **前端不存密钥**：密钥一律只配在后端，前端代码与仓库中不出现任何 Key。
+4. **用户数据留在本地**：数据库（`*.db`）、上传的 PDF、解析结果、向量索引都存放在本机 `data/` 目录，不会进入仓库；备份或迁移时请自行妥善保管，不要外泄。
+5. **生产部署建议**：使用 HTTPS；收紧 `CORS_ORIGINS` 只放自己的域名；数据库从 SQLite 迁移到 PostgreSQL。
 
 ## 贡献指南
 
