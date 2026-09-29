@@ -49,10 +49,16 @@ def _to_out(q: TestQuestion) -> dict:
         "question_text": q.question_text,
         "options": q.options,
         "answer_text": q.answer_text,
+        "original_answer": q.original_answer,
+        "llm_corrected": q.llm_corrected,
+        "llm_verified": q.llm_verified,
         "difficulty": q.difficulty,
         "images": q.images,
         "created_by": q.created_by,
         "verified": q.verified,
+        "source": q.source,
+        "source_doc_id": q.source_doc_id,
+        "page_number": q.page_number,
         "created_at": q.created_at.isoformat() if q.created_at else None,
     }
 
@@ -73,8 +79,10 @@ async def list_questions(
     page_size: int = Query(20, ge=1, le=200),
     subject_id: int | None = None,
     chapter: str | None = None,
+    kp_id: str | None = None,
     question_type: str | None = None,
     difficulty: int | None = None,
+    source: str | None = None,
     search: str | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_teacher_or_admin),
@@ -84,10 +92,14 @@ async def list_questions(
         conditions.append(TestQuestion.subject_id == subject_id)
     if chapter:
         conditions.append(TestQuestion.chapter == chapter)
+    if kp_id:
+        conditions.append(TestQuestion.kp_id == kp_id)
     if question_type:
         conditions.append(TestQuestion.question_type == question_type)
     if difficulty:
         conditions.append(TestQuestion.difficulty == difficulty)
+    if source:
+        conditions.append(TestQuestion.source == source)
     if search:
         conditions.append(TestQuestion.question_text.ilike(f"%{search}%"))
 
@@ -169,3 +181,83 @@ async def delete_question(
     await db.delete(q)
     await db.commit()
     return {"message": "题目已删除"}
+
+
+# ── 从解析文档抽取题目 ──
+
+class ExtractRequest(BaseModel):
+    doc_id: int = Field(..., description="已解析文档 ID")
+    subject_id: int | None = Field(default=None, description="缺省时抽该文档所有 in_qb 学科")
+    chapter: str | None = Field(default=None, description="可选：指定章名，整批题归入该章（无结构纯题目列表时用）")
+
+
+@router.post("/extract")
+async def extract_questions(
+    body: ExtractRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """从解析文档抽取题目到试题库（题解分离 + 章/节对应），供组卷使用。"""
+    from app.models import DocumentSubject
+    from app.services.question_extractor import extract_questions_to_bank
+
+    if body.subject_id:
+        res = await extract_questions_to_bank(db, body.doc_id, body.subject_id, chapter_override=body.chapter)
+        await db.commit()
+        return res
+
+    rows = (await db.execute(
+        select(DocumentSubject).where(
+            DocumentSubject.document_id == body.doc_id,
+            DocumentSubject.in_qb.is_(True),
+        )
+    )).scalars().all()
+    if not rows:
+        raise HTTPException(404, "该文档未分配到任何学科的题库（in_qb）")
+
+    results = []
+    for r in rows:
+        results.append(await extract_questions_to_bank(db, body.doc_id, r.subject_id, chapter_override=body.chapter))
+    await db.commit()
+    return {"doc_id": body.doc_id, "subjects": results}
+
+
+@router.post("/rebuild")
+async def rebuild_question_bank(
+    subject_id: int = Query(..., description="学科 ID"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """重建某学科题库：对 in_qb 的文档增量抽题（含 LLM 校验 + 版本失效重抽）。"""
+    from app.models import DocumentSubject
+    from app.services.question_extractor import extract_questions_to_bank
+
+    rows = (await db.execute(
+        select(DocumentSubject).where(
+            DocumentSubject.subject_id == subject_id,
+            DocumentSubject.in_qb.is_(True),
+        )
+    )).scalars().all()
+    if not rows:
+        await db.commit()
+        return {"subject_id": subject_id, "docs": [], "extracted": 0, "created": 0, "updated": 0, "kept": 0, "corrected": 0}
+
+    doc_results = []
+    created = updated = kept = corrected = 0
+    for r in rows:
+        res = await extract_questions_to_bank(db, r.document_id, r.subject_id, chapter_override=r.qb_chapter)
+        created += res.get("created", 0)
+        updated += res.get("updated", 0)
+        kept += res.get("kept", 0)
+        corrected += res.get("corrected", 0)
+        doc_results.append({"doc_id": r.document_id, **res})
+    await db.commit()
+    return {
+        "subject_id": subject_id,
+        "docs": doc_results,
+        "extracted": created + updated + kept,
+        "created": created,
+        "updated": updated,
+        "kept": kept,
+        "corrected": corrected,
+    }

@@ -1,9 +1,18 @@
+# ── 无 GPU 服务器专用依赖 ──
+# 用法：
+#   1) 先装 CPU 版 torch（避免装到 CUDA 版）：
+#        pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   2) 再装其余：
+#        pip install -r requirements-cpu.txt
+#   （faiss-gpu 已换成 faiss-cpu；torch 不在本文件里，单独走 CPU index 安装）
+
 # ── Web framework ──
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 
 # ── Database ──
 sqlalchemy[asyncio]>=2.0.30
+# asyncpg 仅 PostgreSQL 需要；本机用 SQLite，装不上可整行删掉
 asyncpg>=0.29.0
 alembic>=1.13.0
 
@@ -24,23 +33,23 @@ celery[redis]>=5.4.0
 
 # ── File processing ──
 openpyxl>=3.1.0
-xlrd>=2.0.1  # for legacy .xls
+xlrd>=2.0.1
 pandas>=2.2.0
 
-# ── AI/ML (GPU) ──
-torch>=2.3.0
+# ── AI/ML（CPU 版）──
+# torch 单独装 CPU 版，见文件顶部说明
 transformers>=4.40.0
 sentence-transformers>=3.0.0
-faiss-gpu>=1.7.0  # use faiss-cpu if no GPU available
+faiss-cpu>=1.8.0
 
 # ── PDF parsing ──
-# mineru>=3.4.0  # uncomment when MinerU is installed
+# mineru>=3.4.0  # 独立环境，本机不装
 
 # ── Speech ──
 faster-whisper>=1.0.0
 
 # ── LLM API ──
-openai>=1.30.0  # for DeepSeek API (OpenAI-compatible)
+openai>=1.30.0
 httpx>=0.27.0
 
 # ── Utilities ──

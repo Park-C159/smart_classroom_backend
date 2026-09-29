@@ -93,7 +93,11 @@ class GPUManager:
     # ── Batch operations ──
 
     def clear_gpu(self) -> None:
-        """Move ALL models to CPU and release cached VRAM. Call before MinerU or FAISS rebuild."""
+        """Move ALL models to CPU and release cached VRAM.
+
+        仅在「同进程内」跑需要独占 GPU 的任务时用（如把后端模型让给别的推理）。
+        FAISS 重建索引不能用它——那需要 embedding 在 GPU 上（用 to_gpu("embedding")）。
+        """
         for name in list(self._models.keys()):
             self.to_cpu(name)
         # 释放 PyTorch 缓存分配器占用的显存，让 MinerU（子进程/同进程）能拿到

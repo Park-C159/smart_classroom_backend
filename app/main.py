@@ -10,8 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.api import auth, users, rag, document, subjects, speech, upload, discussion, analytics, exam, knowledge, feedback
-from app.api import test_bank, papers, messages
+from app.api import auth, users, rag, document, subjects, speech, upload, discussion, analytics, knowledge, feedback
+from app.api import test_bank, papers, messages, system
 
 
 @asynccontextmanager
@@ -79,12 +79,12 @@ app.include_router(speech.router)
 app.include_router(upload.router)
 app.include_router(discussion.router)
 app.include_router(analytics.router)
-app.include_router(exam.router)
 app.include_router(knowledge.router)
 app.include_router(feedback.router)
 app.include_router(test_bank.router)
 app.include_router(papers.router)
 app.include_router(messages.router)
+app.include_router(system.router)
 
 
 @app.get("/api/health")

@@ -11,7 +11,7 @@ from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.core.security import get_current_user, get_admin_user, get_teacher_or_admin
 from app.models import (
-    Discussion, DiscussionReply, DiscussionLike, ReplyLike, User,
+    Discussion, DiscussionReply, DiscussionLike, ReplyLike, User, UserSubject,
 )
 from app.schemas.schemas import (
     DiscussionCreate, DiscussionOut, DiscussionReplyCreate, DiscussionReplyOut,
@@ -25,6 +25,14 @@ router = APIRouter(prefix="/api/discussion", tags=["discussion"])
 
 # ── Helpers ──
 
+async def _my_subject_ids(db: AsyncSession, user_id: int) -> list[int]:
+    """学生已分配学科 id 列表（教师/管理员不调用）。"""
+    rows = (await db.execute(
+        select(UserSubject.subject_id).where(UserSubject.user_id == user_id)
+    )).all()
+    return [r[0] for r in rows]
+
+
 def _discussion_to_out(d: Discussion, current_user_id: int, is_liked: bool = False) -> dict:
     """Convert Discussion ORM object to output dict."""
     return {
@@ -34,6 +42,8 @@ def _discussion_to_out(d: Discussion, current_user_id: int, is_liked: bool = Fal
         "user_id": d.user_id,
         "author_name": d.author.real_name or d.author.username if d.author else "",
         "author_avatar": d.author.avatar_url if d.author else None,
+        "author_role": d.author.role if d.author else None,
+        "author_student_id": d.author.student_id if d.author else None,
         "subject_id": d.subject_id,
         "kp_id": d.kp_id,
         "qa_refs": d.qa_refs if d.qa_refs else None,
@@ -55,6 +65,8 @@ def _reply_to_out(r: DiscussionReply, current_user_id: int, is_liked: bool = Fal
         "user_id": r.user_id,
         "author_name": r.user.real_name or r.user.username if r.user else "",
         "author_avatar": r.user.avatar_url if r.user else None,
+        "author_role": r.user.role if r.user else None,
+        "author_student_id": r.user.student_id if r.user else None,
         "content": r.content,
         "parent_id": r.parent_id,
         "like_count": r.like_count,
@@ -78,6 +90,12 @@ async def list_discussions(
     """List discussions with pagination and filters."""
     query = select(Discussion).options(selectinload(Discussion.author))
 
+    # 学生只可见自己学科的讨论
+    user_id = int(current_user["user_id"])
+    if current_user["role"] == "student":
+        my_sids = await _my_subject_ids(db, user_id)
+        query = query.where(Discussion.subject_id.in_(my_sids))
+
     if subject_id:
         query = query.where(Discussion.subject_id == subject_id)
     if kp_id:
@@ -100,7 +118,6 @@ async def list_discussions(
     discussions = result.scalars().all()
 
     # Check likes for current user
-    user_id = int(current_user["user_id"])
     liked_ids = set()
     if discussions:
         disc_ids = [d.id for d in discussions]
@@ -126,10 +143,18 @@ async def create_discussion(
     current_user: dict = Depends(get_current_user),
 ):
     """Create a new discussion post."""
+    user_id = int(current_user["user_id"])
+
+    # 学生只能在自己学科下发帖
+    if current_user["role"] == "student":
+        my_sids = await _my_subject_ids(db, user_id)
+        if data.subject_id not in my_sids:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "只能在自己学科下发帖")
+
     disc = Discussion(
         title=data.title,
         content=data.content,
-        user_id=int(current_user["user_id"]),
+        user_id=user_id,
         subject_id=data.subject_id,
         kp_id=data.kp_id,
         qa_refs=data.qa_refs if data.qa_refs else None,
@@ -143,7 +168,7 @@ async def create_discussion(
         select(Discussion).options(selectinload(Discussion.author)).where(Discussion.id == disc.id)
     )
     disc = result.scalar_one()
-    return _discussion_to_out(disc, int(current_user["user_id"]), False)
+    return _discussion_to_out(disc, user_id, False)
 
 
 @router.get("/{discussion_id}")
@@ -161,6 +186,12 @@ async def get_discussion(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "讨论不存在或已删除")
 
     user_id = int(current_user["user_id"])
+
+    # 学生只可见自己学科的讨论
+    if current_user["role"] == "student":
+        my_sids = await _my_subject_ids(db, user_id)
+        if disc.subject_id not in my_sids:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "无权查看该学科讨论")
 
     # Check if current user liked
     like_result = await db.execute(
@@ -214,8 +245,8 @@ async def delete_discussion(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "讨论不存在")
 
     user_id = int(current_user["user_id"])
-    is_admin = current_user["role"] == "admin"
-    if disc.user_id != user_id and not is_admin:
+    can_moderate = current_user["role"] in ("teacher", "admin")
+    if disc.user_id != user_id and not can_moderate:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "无权删除此讨论")
 
     await db.delete(disc)
@@ -363,8 +394,8 @@ async def delete_reply(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "回复不存在")
 
     user_id = int(current_user["user_id"])
-    is_admin = current_user["role"] == "admin"
-    if reply.user_id != user_id and not is_admin:
+    can_moderate = current_user["role"] in ("teacher", "admin")
+    if reply.user_id != user_id and not can_moderate:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "无权删除此回复")
 
     # Update reply count on parent discussion

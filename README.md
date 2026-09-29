@@ -22,9 +22,10 @@
 | 模块 | 说明 |
 |------|------|
 | 智能答疑（RAG） | 知识库（KB）+ 题库（QB）双向量库，全局检索 → 分别重排 → LLM 流式生成（SSE），支持深度思考与联网搜索 |
-| 教材解析 | PDF 上传 → MinerU 高精度解析 → 知识树 / 分块 / 题目入库 |
-| 知识库管理 | 知识树 CRUD、分块管理、题目（题库）审核与编辑 |
-| 组卷与练习 | 独立试题库 + 按题型组卷（作业 / 测试 / 考试 / 自测练习），逐题判分，简答题支持 LLM 自动评分 |
+| 教材解析 | PDF 上传 → MinerU 高精度解析 → 知识树 / 分块 / 题目自动抽取入库 |
+| 知识库管理 | 知识树 CRUD、分块管理、解析审核 |
+| 试题库 | 独立试题库 `TestQuestion`：Excel 导入 / 手工录入 / 教材自动抽取，按章 / 节 / 题型筛选 |
+| 组卷与练习 | 按题型组卷（作业 / 测试 / 考试 / 自测练习），逐题判分，简答题支持 LLM 自动评分，教师批改 |
 | 学情分析 | 按知识点逐题更新掌握度（EWMA），班级 / 个人学情统计 |
 | 讨论区 & 私信 | 发帖 / 回帖 / 点赞 / 置顶，学生与教师一对一私信 |
 | 语音识别 | Whisper 本地转写（按需加载 / 空闲卸载） |
@@ -34,7 +35,7 @@
 
 | 层 | 技术 |
 |----|------|
-| Web 框架 | FastAPI（Python 3.11+） |
+| Web 框架 | FastAPI（Python 3.11+，开发环境 3.13） |
 | ORM | SQLAlchemy 2.x（async）+ SQLite（生产可迁移 PostgreSQL） |
 | 向量检索 | FAISS + BGE-M3（Embedding）+ BGE-Reranker-v2-m3（重排） |
 | LLM | DeepSeek API（OpenAI 兼容，支持思考模式流式输出） |
@@ -53,18 +54,18 @@ backend/
 │   ├── api/                     # API 路由
 │   │   ├── auth.py              # 登录 / 注册 / 刷新 JWT
 │   │   ├── users.py             # 用户管理 CRUD
-│   │   ├── rag.py               # 答疑 SSE 流式接口（KB + QB 检索）
+│   │   ├── rag.py              # 答疑 SSE 流式接口（路由 /api/chat，KB + QB 检索）
 │   │   ├── document.py          # 教材上传 / 解析 / PDF 查看
 │   │   ├── knowledge.py         # 知识树 CRUD / 分块管理
 │   │   ├── analytics.py         # 学情分析 / 系统概览
-│   │   ├── exam.py              # 组卷 / 批改
-│   │   ├── test_bank.py         # 独立试题库 CRUD
 │   │   ├── papers.py            # 组卷（作业/测试/考试）/ 提交 / 批改
+│   │   ├── test_bank.py         # 独立试题库 CRUD / 自动抽取
 │   │   ├── messages.py          # 私信
 │   │   ├── discussion.py        # 讨论区 CRUD
 │   │   ├── feedback.py          # 反馈建议
 │   │   ├── speech.py            # 语音识别
 │   │   ├── subjects.py          # 学科管理
+│   │   ├── system.py            # 系统监测（日志 / GPU，仅管理员）
 │   │   └── upload.py            # 文件上传 / Excel 导入
 │   ├── models/__init__.py       # SQLAlchemy 模型（全部表）
 │   ├── schemas/                 # Pydantic 请求 / 响应模型
@@ -72,21 +73,23 @@ backend/
 │   │   ├── rag_service.py       # 全局检索 + FAISS 索引 + 重排
 │   │   ├── llm_service.py       # DeepSeek 流式调用 + 简答判分
 │   │   ├── knowledge_tree_service.py
+│   │   ├── question_extractor.py  # 教材题目自动抽取（题号切分 / 答案分离 / 章节对应）
 │   │   ├── document_processor.py
 │   │   ├── file_processor.py
 │   │   ├── chapter_service.py
 │   │   ├── stt_service.py       # Whisper 封装
 │   │   ├── vlm_service.py       # VLM 图片描述
 │   │   ├── web_search.py        # 联网搜索（百度 AI 搜索 / Bing 回退）
-│   │   ├── gpu_manager.py       # GPU 显存调度
-│   │   └── mastery_service.py   # 掌握度更新 helper
+│   │   ├── mastery_service.py   # 掌握度更新 helper
+│   │   └── gpu_manager.py       # GPU 显存调度
 │   ├── core/
 │   │   ├── database.py          # 数据库引擎 & session factory
 │   │   ├── security.py          # JWT 认证 & RBAC
 │   │   └── redis_client.py      # Redis 连接
 │   └── tasks/                   # Celery 异步任务 / 定时调度
 ├── alembic/                     # 数据库迁移骨架
-├── requirements.txt
+├── requirements.txt             # 依赖（GPU 版，faiss-gpu）
+├── requirements-cpu.txt         # 依赖（无 GPU 服务器，faiss-cpu）
 ├── Dockerfile
 ├── .env.example                 # 环境变量模板（无真实密钥）
 └── LICENSE
@@ -121,8 +124,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> - 没有 NVIDIA GPU 时，把 `requirements.txt` 里的 `faiss-gpu` 改为 `faiss-cpu`，再执行安装。
-> - `torch` 建议按 [PyTorch 官网](https://pytorch.org/get-started/locally/) 指引，安装与你的 CUDA 版本匹配的 wheel。
+> **无 NVIDIA GPU（CPU 服务器）时**，用 `requirements-cpu.txt`：
+>
+> ```bash
+> # 先装 CPU 版 torch（避免装到 CUDA 版）
+> pip install torch --index-url https://download.pytorch.org/whl/cpu
+> # 再装其余（faiss-gpu 已换成 faiss-cpu）
+> pip install -r requirements-cpu.txt
+> ```
 
 ### 2. 配置环境变量（密钥 / 隐私保护）
 
@@ -153,15 +162,16 @@ python -c "import secrets; print(secrets.token_hex(32))"
 ### 3. 启动服务
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
 启动后访问：
 
-- 接口文档（Swagger）：`http://localhost:8000/docs`
-- 健康检查：`http://localhost:8000/api/health`
+- 接口文档（Swagger）：`http://localhost:8001/docs`
+- 健康检查：`http://localhost:8001/api/health`
 
 > 首次启动会自动建表，并加载 RAG 模型（Embedding + Reranker），第一次启动会稍慢，属正常现象。
+> 前端开发服务器默认把 `/api` 代理到 `http://localhost:8001`，端口请保持一致。
 
 ### 4. Docker 部署（可选）
 
@@ -186,7 +196,7 @@ docker run --rm -p 8000:8000 --env-file .env smart-classroom-backend
 | `NATAPP_AUTHTOKEN` / `NATAPP_BIN` | - | 内网穿透（可选） |
 | `CUDA_DEVICE` | - | `cuda:0` 或 `cpu` |
 | `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` | - | 模型离线加载开关 |
-| `MINERU_MODE` / `MINERU_API_URL` / `MINERU_BIN` | - | MinerU 解析配置（可选） |
+| `MINERU_MODE` / `MINERU_BACKEND` / `MINERU_API_URL` / `MINERU_BIN` / `MINERU_API_BIN` | - | MinerU 解析配置（可选） |
 | `CORS_ORIGINS` | - | 允许的跨域来源列表 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | - | JWT 有效期 |
 
@@ -197,20 +207,20 @@ docker run --rm -p 8000:8000 --env-file .env smart-classroom-backend
 | 前缀 | 说明 | 权限 |
 |------|------|------|
 | `/api/auth` | 注册 / 登录 / 刷新令牌 | 公开 |
-| `/api/rag` | 智能答疑（SSE 流式） | 登录 |
+| `/api/chat` | 智能答疑（SSE 流式） | 登录 |
 | `/api/users` | 用户管理 | 管理员 / 教师（部分） |
 | `/api/subjects` | 学科管理 | 管理员 / 教师 |
 | `/api/documents` | 教材上传 / 解析 / 查看 | 管理员 / 教师 |
-| `/api/knowledge` | 知识树 / 分块 / 题库 | 管理员 / 教师 |
-| `/api/test-bank` | 独立试题库 CRUD | 管理员 / 教师 |
+| `/api/knowledge` | 知识树 / 分块管理 | 管理员 / 教师 |
+| `/api/test-bank` | 独立试题库 CRUD / 自动抽取 | 管理员 / 教师 |
 | `/api/papers` | 组卷 / 发布 / 提交 / 批改 | 教师 + 学生 |
-| `/api/exam` | 自测练习 | 登录 |
 | `/api/analytics` | 学情分析 / 系统概览 | 登录 / 管理员 |
 | `/api/discussion` | 讨论区 | 登录 |
 | `/api/messages` | 私信 | 登录 |
 | `/api/speech` | 语音转写 | 登录 |
-| `/api/feedback` | 反馈建议 | 登录 |
+| `/api/feedbacks` | 反馈建议 | 登录 |
 | `/api/upload` | 文件上传 / Excel 批量导入 | 管理员 / 教师 |
+| `/api/system` | 系统监测（日志 / GPU） | 管理员 |
 
 ## 隐私与安全
 

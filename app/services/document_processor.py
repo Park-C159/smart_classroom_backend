@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -14,6 +15,60 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 MINERU_TIMEOUT = int(os.getenv("MINERU_TIMEOUT", "7200"))
+# MinerU 客户端/服务端等待单个解析任务的内部超时（默认 3600s）。
+# 扫描版大文档在 OCR 下可能超过 1 小时，提高到与子进程超时一致。
+MINERU_TASK_RESULT_TIMEOUT = int(os.getenv("MINERU_TASK_RESULT_TIMEOUT_SECONDS", "7200"))
+
+# 跟踪每个文档正在运行的 MinerU 子进程，便于删除/取消解析时 kill
+_RUNNING_MINERU: dict[int, subprocess.Popen] = {}
+
+
+def cancel_mineru_process(doc_id: int) -> None:
+    """终止某文档正在运行的 MinerU 子进程（删除/取消解析时调用）。"""
+    proc = _RUNNING_MINERU.pop(doc_id, None)
+    if proc is not None and proc.poll() is None:
+        try:
+            # Windows 下用 taskkill /T 杀整个进程树（含本地 mineru-api 子进程），确保 GPU 停
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        except Exception:
+            pass
+
+
+def _run_mineru_cmd(cmd: list, env: dict, doc_id: int, timeout: int, log_f=None) -> tuple[int, str]:
+    """运行 mineru 子进程并跟踪；输出实时流式写入 log_f。返回 (returncode, 尾部几行)。"""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="ignore", env=env, bufsize=1,
+    )
+    _RUNNING_MINERU[doc_id] = proc
+    tail: list[str] = []
+
+    def _stream():
+        try:
+            for line in proc.stdout:
+                if log_f is not None:
+                    try:
+                        log_f.write(line)
+                        log_f.flush()
+                    except Exception:
+                        pass
+                tail.append(line)
+                if len(tail) > 50:
+                    tail.pop(0)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_stream, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    finally:
+        _RUNNING_MINERU.pop(doc_id, None)
+    t.join(timeout=5)
+    return proc.returncode, "".join(tail[-5:])
 
 
 def _resolve_mineru_bin() -> Optional[str]:
@@ -168,7 +223,7 @@ class DocumentProcessor:
         logger.info("📄 PDF 共 %d 页", total_pages)
 
         log_file = doc_dir / "mineru.log"
-        with open(log_file, "w", encoding="utf-8", errors="ignore", buffering=1) as log_f:
+        with open(log_file, "a", encoding="utf-8", errors="ignore", buffering=1) as log_f:
             def _write_log(msg: str):
                 import datetime
                 ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -176,16 +231,22 @@ class DocumentProcessor:
                 log_f.flush()
 
             _write_log(f"开始解析: {pdf_path.name} ({total_pages} 页)")
-            _write_log("模式: hybrid-engine + OCR + formula + table, effort=high（高精度，含 VLM）")
+            backend = settings.MINERU_BACKEND or "pipeline"
+            _write_log(f"模式: {backend} + auto 方法（文本型走 txt，扫描型走 OCR）")
 
+            # pipeline 后端：Layout + OCR + 公式 + 表格，非自回归模型，不用 VLM，快且不吃显存。
+            # hybrid-engine 后端：内容抽取走 VLM，质量高但慢、吃显存（仅需要时才手动切）。
             cmd = [
                 MINERU_BIN, "-p", str(pdf_path), "-o", str(doc_dir),
-                "-b", "hybrid-engine",
-                "-m", "ocr",
+                "-b", backend,
+                "-m", "auto",       # 自动识别文本/扫描
                 "-l", "ch",
-                "--effort", "high",
-                "--image-analysis", "true",
             ]
+            if backend.startswith("hybrid"):
+                cmd += ["--effort", "high", "--image-analysis", "true"]
+            mineru_env = {**os.environ, "PYTHONUNBUFFERED": "1", "MINERU_TASK_RESULT_TIMEOUT_SECONDS": str(MINERU_TASK_RESULT_TIMEOUT)}
+            # 限低 ModelScope 模型下载并发，避免运行时补下模型时触发 "Too much connections" 限流
+            mineru_env.setdefault("MODELSCOPE_DOWNLOAD_PARALLEL_WORKERS", "4")
             # 优先连常驻 mineru-api
             api_url = settings.MINERU_API_URL
             if api_url:
@@ -193,28 +254,33 @@ class DocumentProcessor:
                 _write_log(f"连接常驻 MinerU API: {api_url}")
 
             logger.info("🚀 MinerU CLI: %s", " ".join(cmd))
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=MINERU_TIMEOUT,
-                encoding="utf-8", errors="ignore",
-            )
+            # 常驻 API：记录其日志偏移，解析完成后把新增日志（含进度）追加到本文件
+            api_log_path = self.data_dir.parent / "mineru_api.log"
+            api_log_offset = api_log_path.stat().st_size if (api_url and api_log_path.exists()) else 0
+
+            returncode, tail = _run_mineru_cmd(cmd, mineru_env, doc_id, MINERU_TIMEOUT, log_f)
 
             # 常驻服务失败 → 回退临时服务
-            if result.returncode != 0 and api_url:
-                _write_log(f"常驻服务失败，回退临时服务: {result.stderr[:800]}")
+            if returncode != 0 and api_url:
+                _write_log(f"常驻服务失败，回退临时服务: {tail[:800]}")
                 fallback = [c for c in cmd if c != "--api-url" and c != api_url]
-                result = subprocess.run(
-                    fallback, capture_output=True, text=True, timeout=MINERU_TIMEOUT,
-                    encoding="utf-8", errors="ignore",
-                )
+                returncode, tail = _run_mineru_cmd(fallback, mineru_env, doc_id, MINERU_TIMEOUT, log_f)
 
-            if result.stdout:
-                log_f.write(result.stdout)
-            if result.stderr:
-                log_f.write(result.stderr)
+            # 常驻 API：把解析期间 API 服务新增的日志（含进度）追加进来
+            if api_url and api_log_path.exists():
+                try:
+                    with open(api_log_path, "r", encoding="utf-8", errors="ignore") as f:
+                        f.seek(api_log_offset)
+                        api_new = f.read()
+                    if api_new:
+                        log_f.write("\n[-- MinerU API 服务日志 --]\n")
+                        log_f.write(api_new)
+                except Exception:
+                    pass
             log_f.flush()
 
-            if result.returncode != 0:
-                raise Exception(f"MinerU 解析失败: {result.stderr[:500]}")
+            if returncode != 0:
+                raise Exception(f"MinerU 解析失败: {tail[:500]}")
 
             _write_log("✅ MinerU 解析完成，正在收集输出文件...")
 

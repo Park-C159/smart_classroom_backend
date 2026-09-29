@@ -4,14 +4,14 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.core.security import get_current_user, get_teacher_or_admin
 from app.models import (
-    User, Paper, PaperQuestion, PaperSubmission, PaperAnswer, TestQuestion,
+    User, Paper, PaperQuestion, PaperSubmission, PaperAnswer, TestQuestion, UserSubject,
 )
 from app.services.llm_service import LLMService
 from app.services.mastery_service import update_kp_mastery
@@ -35,7 +35,7 @@ class GenerateRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
     mode: str = "practice"
     subject_id: int | None = None
-    chapter: str | None = None
+    chapters: list[str] = []           # 章节范围（多选；为空则全学科）
     difficulty_min: int = Field(default=1, ge=1, le=5)
     difficulty_max: int = Field(default=5, ge=1, le=5)
     counts: Counts = Field(default_factory=Counts)
@@ -107,8 +107,14 @@ async def _paper_visible_to(db, paper: Paper, user_id: int, role: str) -> bool:
         return False
     if paper.mode == "practice":
         return paper.created_by == user_id
+    # 非练习：按学科（已分配）下发 + 班级（可选）过滤
+    my_sids = [r[0] for r in (await db.execute(
+        select(UserSubject.subject_id).where(UserSubject.user_id == user_id)
+    )).all()]
+    subject_ok = (not my_sids) or (not paper.subject_id) or (paper.subject_id in my_sids)
     cls = await _get_user_class(db, user_id)
-    return bool(paper.target_class) and paper.target_class == cls
+    class_ok = (not paper.target_class) or (paper.target_class == cls)
+    return subject_ok and class_ok
 
 
 # ── Generate ──
@@ -126,8 +132,7 @@ async def generate_paper(
     if mode in ("homework", "test", "exam"):
         if role not in ("teacher", "admin"):
             raise HTTPException(403, "只有教师或管理员可以创建作业/测试/考试")
-        if not body.target_class:
-            raise HTTPException(400, "作业/测试/考试需要指定班级")
+        # target_class 可选：留空则按学科下发给该学科全体学生
 
     counts = body.counts
     selected: list[TestQuestion] = []
@@ -140,8 +145,9 @@ async def generate_paper(
             TestQuestion.difficulty >= body.difficulty_min,
             TestQuestion.difficulty <= body.difficulty_max,
         ]
-        if body.chapter:
-            conds.append(TestQuestion.chapter == body.chapter)
+        chapters = [c for c in (body.chapters or []) if c]
+        if chapters:
+            conds.append(TestQuestion.chapter.in_(chapters))
         if body.subject_id:
             conds.append(TestQuestion.subject_id == body.subject_id)
         pool = (await db.execute(select(TestQuestion).where(and_(*conds)))).scalars().all()
@@ -154,11 +160,11 @@ async def generate_paper(
         title=body.title,
         subject_id=body.subject_id,
         mode=mode,
-        chapter=body.chapter,
+        chapter=",".join(chapters) if chapters else None,
         difficulty_min=body.difficulty_min,
         difficulty_max=body.difficulty_max,
         created_by=current_user["user_id"],
-        target_class=body.target_class if mode != "practice" else None,
+        target_class=(body.target_class or None) if mode != "practice" else None,
         published=(mode == "practice"),
         due_at=body.due_at,
     )
@@ -227,14 +233,23 @@ async def list_papers(
         if role == "teacher":
             conds.append(Paper.created_by == user_id)
     else:
-        # 学生：已发布 且（作业/测试/考试匹配班级 或 自测练习属于自己）
+        # 学生：已发布 且（作业/测试/考试按学科下发到对应学生、班级可选 或 自测练习属于自己）
         cls = await _get_user_class(db, user_id)
+        my_sids = [r[0] for r in (await db.execute(
+            select(UserSubject.subject_id).where(UserSubject.user_id == user_id)
+        )).all()]
         conds.append(Paper.published.is_(True))
         or_cond = []
+        # 非练习：学科匹配（未分配学科则不限）+ 班级匹配（未指定班级则学科全体可见）
+        and_conds = []
+        if my_sids:
+            and_conds.append(or_(Paper.subject_id.in_(my_sids), Paper.subject_id.is_(None)))
         if cls:
-            or_cond.append(Paper.target_class == cls)
+            and_conds.append(or_(Paper.target_class == cls, Paper.target_class.is_(None)))
+        else:
+            and_conds.append(Paper.target_class.is_(None))
+        or_cond.append(and_(*and_conds))
         or_cond.append(and_(Paper.mode == "practice", Paper.created_by == user_id))
-        from sqlalchemy import or_
         conds.append(or_(*or_cond))
 
     base = select(Paper)
@@ -295,6 +310,37 @@ async def get_paper(
     }
 
 
+# ── Delete ──
+
+@router.delete("/{paper_id}")
+async def delete_paper(
+    paper_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除试卷：教师/管理员可删任意，学生仅可删自己的练习。"""
+    paper = (await db.execute(select(Paper).where(Paper.id == paper_id))).scalar_one_or_none()
+    if not paper:
+        raise HTTPException(404, "试卷不存在")
+
+    role = current_user["role"]
+    user_id = current_user["user_id"]
+    can_delete = role in ("teacher", "admin") or (
+        paper.mode == "practice" and paper.created_by == user_id
+    )
+    if not can_delete:
+        raise HTTPException(403, "无权删除该试卷")
+
+    # SQLite 未开外键级联，需手动删子表，避免遗留孤儿数据
+    sub_ids = select(PaperSubmission.id).where(PaperSubmission.paper_id == paper_id)
+    await db.execute(delete(PaperAnswer).where(PaperAnswer.submission_id.in_(sub_ids)))
+    await db.execute(delete(PaperSubmission).where(PaperSubmission.paper_id == paper_id))
+    await db.execute(delete(PaperQuestion).where(PaperQuestion.paper_id == paper_id))
+    await db.delete(paper)
+    await db.commit()
+    return {"message": "试卷已删除"}
+
+
 # ── Start answering ──
 
 @router.post("/{paper_id}/start")
@@ -338,9 +384,9 @@ async def start_paper(
         db.add(PaperAnswer(submission_id=sub.id, paper_question_id=q.id))
     await db.commit()
 
-    a_map = {a.paper_question_id: a.user_answer for a in sub.answers}
+    # 新建答卷无作答，直接返回空答案（不可惰性访问 sub.answers，async 下会触发 MissingGreenlet）
     questions_out = [
-        {**_q_to_out(q), "user_answer": a_map.get(q.id, "") or ""}
+        {**_q_to_out(q), "user_answer": ""}
         for q in sorted(paper.questions, key=lambda x: x.sort_order)
     ]
     return {

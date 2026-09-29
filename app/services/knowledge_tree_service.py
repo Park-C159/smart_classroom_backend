@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import KnowledgePoint, ContentChunk, Exercise, Document
+from app.models import KnowledgePoint, ContentChunk, Document
 
 logger = logging.getLogger(__name__)
 
@@ -143,33 +143,15 @@ class KnowledgeTreeService:
         doc_type = "textbook" if is_primary else "reference"
         structure = self._parse_structure(pages, doc_id=doc_id if not is_primary else 0, is_primary=is_primary, doc_type=doc_type)
 
-        # Process images with VLM and inject descriptions into chunk content
-        vlm_count = await self._process_vlm_images(structure, doc_id=doc_id if not is_primary else 1)
-
-        # Store knowledge tree + content chunks (knowledge base)
-        kp_count = await self._store_knowledge_points(db, structure, subject_id)
+        # 知识树已改为手动构建（每个学科一棵可展开目录，叶节点=知识点，不含内容块）。
+        # 这里只从解析结果生成内容块（知识库，供答疑检索），不再自动写章节/知识点树。
         chunk_count = await self._store_content_chunks(db, structure, doc_id, subject_id)
 
-        # Split and store question bank (textbook: all exercises; reference: exercises only)
-        qb_count = await self._store_question_bank(
-            db, structure, subject_id, doc_id,
-            doc_type="textbook" if is_primary else "reference"
-        )
-
-        # Also keep legacy exercise storage for textbook
-        if is_primary:
-            ex_count = await self._store_exercises(db, structure, subject_id, doc_id)
-        else:
-            ex_count = await self._supplement_exercises(db, structure, subject_id, doc_id)
-
+        # 教材解析不再抽取习题/题库、也不用 VLM 处理图片：习题功能已移除，题库后续用新方式构建
         return {
             "doc_id": doc_id, "is_primary": is_primary,
             "chapters": len(structure["chapters"]),
-            "knowledge_points": kp_count,
             "content_chunks": chunk_count,
-            "question_bank": qb_count,
-            "exercises": ex_count,
-            "vlm_processed": vlm_count,
         }
 
     # ── File location ──
@@ -603,11 +585,13 @@ class KnowledgeTreeService:
             existing = await db.scalar(select(KnowledgePoint).where(KnowledgePoint.id == ch_id))
             if existing:
                 existing.title = chapter["title"]
+                existing.subject_id = subject_id
             else:
                 db.add(KnowledgePoint(
                     id=ch_id, title=chapter["title"],
                     chapter=chapter["title"],
                     level=0, sort_order=count,
+                    subject_id=subject_id,
                 ))
             count += 1
 
@@ -619,12 +603,14 @@ class KnowledgeTreeService:
                     existing.title = sec_title
                     existing.parent_id = ch_id
                     existing.level = 1
+                    existing.subject_id = subject_id
                 else:
                     db.add(KnowledgePoint(
                         id=sec_id, title=sec_title,
                         chapter=chapter["title"],
                         parent_id=ch_id, level=1,
                         sort_order=count,
+                        subject_id=subject_id,
                     ))
                 count += 1
 
@@ -636,12 +622,14 @@ class KnowledgeTreeService:
                         existing.title = kp_title
                         existing.parent_id = sec_id
                         existing.level = 2
+                        existing.subject_id = subject_id
                     else:
                         db.add(KnowledgePoint(
                             id=kp_id, title=kp_title,
                             chapter=chapter["title"],
                             parent_id=sec_id, level=2,
                             sort_order=count,
+                            subject_id=subject_id,
                         ))
                     count += 1
 
@@ -682,224 +670,6 @@ class KnowledgeTreeService:
         await db.flush()
         logger.info("📊 知识库: %d 块 (doc=%d)", count, doc_id)
         return count
-
-    async def _store_question_bank(
-        self, db: AsyncSession, structure: dict, subject_id: int, doc_id: int, doc_type: str = "textbook"
-    ) -> int:
-        """Store exercises into QuestionBank with deduplication and answer separation."""
-        from app.models import QuestionBank
-        from sqlalchemy import select as sa_select
-
-        count = 0
-        for chapter in structure.get("chapters", []):
-            chapter_title = chapter.get("title", "")
-            for section in chapter.get("sections", []):
-                sec_title = section.get("title", "")
-                for ex_entry in section.get("exercises", []):
-                    # Extract question text and answer
-                    if isinstance(ex_entry, str):
-                        full_text = ex_entry
-                        page_num = None
-                    else:
-                        full_text = ex_entry.get("text", "")
-                        page_num = ex_entry.get("page")
-
-                    question_text, answer_text = self._split_answer(full_text)
-
-                    # Extract images for this exercise
-                    ex_images = None
-                    if isinstance(ex_entry, dict) and ex_entry.get("images"):
-                        ex_images = [{"path": p, "vlm_desc": None} for p in ex_entry["images"]]
-
-                    # Build embedding text (question + VLM descs for vector search)
-                    embedding_parts = [question_text]
-                    if ex_images:
-                        for img in ex_images:
-                            if img.get("vlm_desc"):
-                                embedding_parts.append(img["vlm_desc"])
-                    embedding_text = "\n".join(embedding_parts)
-
-                    # Guess type and difficulty
-                    q_type = self._guess_type(question_text)
-                    difficulty = 3
-
-                    db.add(QuestionBank(
-                        question_text=question_text,
-                        answer_text=answer_text,
-                        question_type=q_type,
-                        difficulty=difficulty,
-                        source=doc_type,
-                        source_doc_id=doc_id,
-                        page_number=page_num,
-                        chapter=chapter_title,
-                        kp_id=f"{chapter.get('kp_id', '')}.{list(chapter.get('sections',[])).index(section)+1}" if chapter.get("kp_id") else None,
-                        subject_id=subject_id,
-                        images=ex_images,
-                        embedding_text=embedding_text,
-                    ))
-                    count += 1
-
-        if count > 0:
-            await db.flush()
-            logger.info("📝 题库: %d 题 (doc=%d, %s)", count, doc_id, doc_type)
-        return count
-
-    async def _store_exercises(
-        self, db: AsyncSession, structure: dict, subject_id: int, doc_id: int
-    ) -> int:
-        """Store exercises with PDF page numbers, linked to level-2 KPs.
-
-        Exercises are linked to the FIRST KP of their section.
-        """
-        count = 0
-        for chapter in structure["chapters"]:
-            for si, section in enumerate(chapter.get("sections", [])):
-                sec_id = f"{chapter['kp_id']}.{si + 1}"
-                # Link exercises to the first KP of the section
-                kps = section.get("kps", [])
-                kp_id = f"{sec_id}.1" if kps else sec_id
-                for ex_entry in section.get("exercises", []):
-                    if isinstance(ex_entry, str):
-                        ex_text = ex_entry
-                        page_num = None
-                        existing_answer = None
-                    else:
-                        ex_text = ex_entry.get("text", "")
-                        page_num = ex_entry.get("page_number")
-                        existing_answer = ex_entry.get("answer")
-                    q, a = self._split_answer(ex_text)
-                    answer = existing_answer or a  # Prefer pre-split answer
-                    db.add(Exercise(
-                        kp_id=kp_id,
-                        question_text=q or ex_text,
-                        answer_text=answer,
-                        question_type=self._guess_type(q or ex_text),
-                        difficulty=3,
-                        source="textbook",
-                        source_doc_id=doc_id,
-                        page_number=page_num,
-                    ))
-                    count += 1
-        await db.flush()
-        logger.info("📊 习题: %d (subject=%d, with page numbers)", count, subject_id)
-        return count
-
-    async def _supplement_exercises(
-        self, db: AsyncSession, structure: dict, subject_id: int, doc_id: int
-    ) -> int:
-        """For reference docs: supplement answers to existing exercises."""
-        new_exs = []
-        for chapter in structure["chapters"]:
-            for si, section in enumerate(chapter.get("sections", [])):
-                sec_id = f"{chapter['kp_id']}.{si + 1}"
-                kps = section.get("kps", [])
-                kp_id = f"{sec_id}.1" if kps else sec_id
-                for ex_entry in section.get("exercises", []):
-                    ex_text = ex_entry if isinstance(ex_entry, str) else ex_entry.get("text", "")
-                    page_num = None if isinstance(ex_entry, str) else ex_entry.get("page_number")
-                    q, a = self._split_answer(ex_text)
-                    new_exs.append({
-                        "kp_id": kp_id, "question": q or ex_text,
-                        "answer": a, "page_number": page_num,
-                    })
-
-        all_kp_ids = list(set(e["kp_id"] for e in new_exs))
-        unanswered = []
-        if all_kp_ids:
-            r = await db.execute(select(Exercise).where(
-                Exercise.kp_id.in_(all_kp_ids),
-                Exercise.answer_text.is_(None),
-            ))
-            unanswered = r.scalars().all()
-
-        supplemented, added = 0, 0
-        for ne in new_exs:
-            if not ne["question"] or len(ne["question"]) < 5:
-                continue
-            matched = False
-            for ue in unanswered:
-                if ue.answer_text:
-                    continue
-                if self._text_similarity(ne["question"], ue.question_text) > 0.5:
-                    ue.answer_text = ne["answer"]
-                    ue.source_doc_id = doc_id
-                    if ne.get("page_number"):
-                        ue.page_number = ne["page_number"]
-                    supplemented += 1
-                    matched = True
-                    break
-            if not matched and ne["answer"]:
-                db.add(Exercise(
-                    kp_id=ne["kp_id"],
-                    question_text=ne["question"],
-                    answer_text=ne["answer"],
-                    question_type=self._guess_type(ne["question"]),
-                    difficulty=3, source="textbook",
-                    source_doc_id=doc_id,
-                    page_number=ne.get("page_number"),
-                ))
-                added += 1
-        await db.flush()
-        logger.info("📊 补充: +%d答案 +%d新题 (doc=%d)", supplemented, added, doc_id)
-        return supplemented + added
-
-    # ── Helpers ──
-
-    def _split_answer(self, text: str) -> tuple:
-        """Split Q&A within a single exercise/example block.
-
-        Strategy:
-        - 解/答/答案/略解/分析 are safe answer markers (never part of the question)
-        - 证明/证 are ambiguous: at the start they're the PROBLEM statement
-          ("证明：XXX" = what to prove), only mid-text do they mark the ANSWER.
-        """
-        # Safe answer markers
-        for pat in [
-            r'\n\s*解\s*[:：]',
-            r'^\s*解\s*[:：]',
-            r'\n\s*解\s+',             # 解 followed by content (no colon needed)
-            r'\n\s*解\s*\n',           # 解 on its own line
-            r'\n\s*答\s*[:：]',
-            r'^\s*答\s*[:：]',
-            r'\n\s*答案\s*[:：]',
-            r'\n\s*略解\s*[:：]',
-            r'\n\s*分析\s*[:：]',
-        ]:
-            m = re.search(pat, text, re.MULTILINE)
-            if m:
-                return text[:m.start()].strip(), text[m.start():].strip()
-
-        # 证明/证: only split mid-text (after 10+ chars), NOT at the beginning
-        for pat in [
-            r'\n\s*证明\s*[:：]',
-            r'\n\s*证明\s+',           # 证明 followed by content (no colon)
-            r'\n\s*证明\s*\n',
-            r'\n\s*证\s*[:：]',
-            r'\n\s*证\s+',             # 证 followed by content (no colon)
-            r'\n\s*证\s*\n',
-        ]:
-            m = re.search(pat, text, re.MULTILINE)
-            if m and m.start() > 10:
-                return text[:m.start()].strip(), text[m.start():].strip()
-
-        return text, None
-
-    def _guess_type(self, text: str) -> str:
-        if re.search(r'[A-D][\.\)]\s', text) or '选择' in text:
-            return "choice"
-        if '证明' in text or '求证' in text:
-            return "proof"
-        if '填空' in text or '___' in text:
-            return "fill"
-        return "calculation"
-
-    def _text_similarity(self, a: str, b: str) -> float:
-        a = re.sub(r'\s+', '', a)[:200]
-        b = re.sub(r'\s+', '', b)[:200]
-        if not a or not b:
-            return 0.0
-        sa, sb = set(a), set(b)
-        return len(sa & sb) / max(1, len(sa | sb))
 
     # ── Preview ──
 

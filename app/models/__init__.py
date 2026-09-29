@@ -42,6 +42,7 @@ class KnowledgePoint(Base):
     chapter: Mapped[str | None] = mapped_column(String(50))
     level: Mapped[int] = mapped_column(Integer, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    subject_id: Mapped[int | None] = mapped_column(Integer, index=True)  # 所属学科（手动构建的知识树按学科归属）
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # relationships
@@ -52,7 +53,6 @@ class KnowledgePoint(Base):
         "KnowledgePoint", back_populates="children", remote_side=[parent_id], foreign_keys=[parent_id]
     )
     content_chunks: Mapped[list["ContentChunk"]] = relationship(back_populates="knowledge_point")
-    exercises: Mapped[list["Exercise"]] = relationship(back_populates="knowledge_point")
     masteries: Mapped[list["KPMastery"]] = relationship(back_populates="knowledge_point")
 
 
@@ -74,25 +74,19 @@ class ContentChunk(Base):
     knowledge_point: Mapped["KnowledgePoint"] = relationship(back_populates="content_chunks")
 
 
-class Exercise(Base):
-    __tablename__ = "exercises"
+class ChunkKpMap(Base):
+    """知识树 ↔ 分块 映射：记录每个分块归属的章/节（供学情分析，支持局部重匹配）。
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    kp_id: Mapped[str] = mapped_column(String(20), ForeignKey("knowledge_points.id"), nullable=False, index=True)
-    question_text: Mapped[str] = mapped_column(Text, nullable=False)
-    answer_text: Mapped[str | None] = mapped_column(Text)
-    question_type: Mapped[str] = mapped_column(String(20), default="calculation")  # choice|fill|proof|calculation
-    difficulty: Mapped[int] = mapped_column(Integer, default=3)
-    source: Mapped[str] = mapped_column(String(20), default="textbook")  # textbook | teacher
-    page_number: Mapped[int | None] = mapped_column(Integer)
-    faiss_id: Mapped[int | None] = mapped_column(Integer)
-    images: Mapped[dict | None] = mapped_column(JSON)  # [{"path": "...", "vlm_desc": "..."}]
-    embedding_text: Mapped[str | None] = mapped_column(Text)  # text for FAISS (includes VLM desc)
-    verified: Mapped[bool] = mapped_column(Boolean, default=False)
-    source_doc_id: Mapped[int | None] = mapped_column(Integer)  # source document ID
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    单独建表存储，与 content_chunks.kp_id 解耦；知识树增删后只需重匹配受影响的块。
+    """
 
-    knowledge_point: Mapped["KnowledgePoint"] = relationship(back_populates="exercises")
+    __tablename__ = "chunk_kp_map"
+
+    chunk_id: Mapped[int] = mapped_column(Integer, primary_key=True)  # = content_chunks.id
+    subject_id: Mapped[int] = mapped_column(Integer, index=True)
+    chapter_id: Mapped[str | None] = mapped_column(String(20), index=True)
+    section_id: Mapped[str | None] = mapped_column(String(20), index=True)
+    similarity: Mapped[float] = mapped_column(Float, default=0.0)
 
 
 # ── Analytics ──
@@ -190,6 +184,7 @@ class Subject(Base):
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     primary_doc_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("documents.id"), default=None)  # Primary textbook
+    example_questions: Mapped[str | None] = mapped_column(Text)  # JSON 数组字符串：欢迎页示例问题
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -224,76 +219,15 @@ class DocumentSubject(Base):
     __tablename__ = "document_subjects"
     document_id: Mapped[int] = mapped_column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True)
     subject_id: Mapped[int] = mapped_column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), primary_key=True)
+    in_kb: Mapped[bool] = mapped_column(Boolean, default=True)   # 是否进入该学科知识库
+    in_qb: Mapped[bool] = mapped_column(Boolean, default=True)   # 是否进入该学科题库
+    qb_chapter: Mapped[str | None] = mapped_column(String(255), nullable=True)  # 抽题指定章（无结构纯题目列表时）
 
 
 class UserSubject(Base):
     __tablename__ = "user_subjects"
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     subject_id: Mapped[int] = mapped_column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), primary_key=True)
-
-
-# ── Question Bank ──
-
-class QuestionBank(Base):
-    """Deduplicated question bank — questions separated from answers, linked to chapters."""
-    __tablename__ = "question_bank"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    question_text: Mapped[str] = mapped_column(Text, nullable=False)
-    answer_text: Mapped[str | None] = mapped_column(Text)           # Separated answer (None if no answer)
-    question_type: Mapped[str] = mapped_column(String(20), default="calculation")  # calculation|proof|choice|fill
-    difficulty: Mapped[int] = mapped_column(Integer, default=3)     # 1-5
-    source: Mapped[str] = mapped_column(String(20), default="textbook")  # textbook | reference | teacher
-    source_doc_id: Mapped[int | None] = mapped_column(Integer)       # Source document
-    page_number: Mapped[int | None] = mapped_column(Integer)         # PDF page
-    chapter: Mapped[str | None] = mapped_column(String(100), index=True)  # Chapter only (e.g. "第一章 多项式")
-    kp_id: Mapped[str | None] = mapped_column(String(20), ForeignKey("knowledge_points.id"), index=True)
-    subject_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("subjects.id"), index=True)
-    images: Mapped[dict | None] = mapped_column(JSON)               # [{"path": "...", "vlm_desc": "..."}]
-    faiss_id: Mapped[int | None] = mapped_column(Integer)            # QB vector index ID
-    embedding_text: Mapped[str | None] = mapped_column(Text)         # Text used for embedding (incl. VLM desc)
-    verified: Mapped[bool] = mapped_column(Boolean, default=False)
-    merged_from: Mapped[list | None] = mapped_column(JSON)           # [source question IDs merged]
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-# ── Exam ──
-
-class Exam(Base):
-    __tablename__ = "exams"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
-    subject_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("subjects.id"))
-    kp_ids: Mapped[dict | None] = mapped_column(JSON)  # list of KP IDs covered
-    total_questions: Mapped[int] = mapped_column(Integer, default=0)
-    correct_count: Mapped[int | None] = mapped_column(Integer)
-    score: Mapped[float | None] = mapped_column(Float)  # 0-100
-    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)  # draft | submitted | graded
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    user: Mapped["User"] = relationship(foreign_keys=[user_id])
-    # passive_deletes: SQLite 不启用外键级联，删 exam 时别让 SQLAlchemy 去置空 children 的 FK
-    questions: Mapped[list["ExamQuestion"]] = relationship(back_populates="exam", passive_deletes=True)
-
-
-class ExamQuestion(Base):
-    __tablename__ = "exam_questions"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    exam_id: Mapped[int] = mapped_column(Integer, ForeignKey("exams.id", ondelete="CASCADE"), nullable=False, index=True)
-    exercise_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("exercises.id"))
-    question_text: Mapped[str] = mapped_column(Text, nullable=False)
-    answer_text: Mapped[str | None] = mapped_column(Text)
-    question_type: Mapped[str] = mapped_column(String(20), default="calculation")
-    difficulty: Mapped[int] = mapped_column(Integer, default=3)
-    sort_order: Mapped[int] = mapped_column(Integer, default=0)
-    user_answer: Mapped[str | None] = mapped_column(Text)
-    is_correct: Mapped[bool | None] = mapped_column(Boolean)
-
-    exam: Mapped["Exam"] = relationship(back_populates="questions")
-    exercise: Mapped["Exercise | None"] = relationship(foreign_keys=[exercise_id])
 
 
 # ── Feedback ──
@@ -324,10 +258,17 @@ class TestQuestion(Base):
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
     options: Mapped[list | None] = mapped_column(JSON)  # choice: [{"key":"A","text":"..."}, ...]
     answer_text: Mapped[str] = mapped_column(Text, nullable=False)  # choice=正确key 如"A"/"AC"；fill=期望答案；short_answer=参考答案
+    original_answer: Mapped[str | None] = mapped_column(Text)      # 抽取时的原始答案（LLM 修正后保留，供对比）
+    llm_corrected: Mapped[bool] = mapped_column(Boolean, default=False)  # 答案是否被 LLM 修正过
+    llm_verified: Mapped[bool] = mapped_column(Boolean, default=False)   # 答案是否已通过 LLM 校验（含未改动）
+    extract_version: Mapped[int] = mapped_column(Integer, default=0)     # 抽取该题时的代码版本（用于代码变更后重抽）
     difficulty: Mapped[int] = mapped_column(Integer, default=3)  # 1-5
     images: Mapped[dict | None] = mapped_column(JSON)
     created_by: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"))
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(20), default="manual", index=True)  # manual | auto
+    source_doc_id: Mapped[int | None] = mapped_column(Integer)  # 来源文档（自动抽取）
+    page_number: Mapped[int | None] = mapped_column(Integer)    # 来源页码
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -413,6 +354,8 @@ class Message(Base):
     recipient_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     is_read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    deleted_by_sender: Mapped[bool] = mapped_column(Boolean, default=False)     # 发送方已单方删除
+    deleted_by_recipient: Mapped[bool] = mapped_column(Boolean, default=False)  # 接收方已单方删除
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     sender: Mapped["User"] = relationship(foreign_keys=[sender_id])

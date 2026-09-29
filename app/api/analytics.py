@@ -1,6 +1,8 @@
 """Learning analytics API — mastery tracking, dashboards."""
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, and_
+import re
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -8,8 +10,8 @@ from app.core.database import get_db
 from app.core.security import get_current_user, get_admin_user, get_teacher_or_admin
 from app.models import (
     User, Subject, Document, KnowledgePoint, ContentChunk,
-    InteractionLog, KPMastery, Discussion, Exam, QuestionBank,
-    Paper, PaperSubmission,
+    InteractionLog, KPMastery, Discussion, TestQuestion,
+    Paper, PaperSubmission, ChunkKpMap,
 )
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
@@ -110,21 +112,6 @@ async def get_my_stats(
     )
     recent = result.scalars().all()
 
-    # Exam stats
-    total_exams = await db.scalar(
-        select(func.count(Exam.id)).where(Exam.user_id == user_id)
-    )
-    graded_exams = await db.scalar(
-        select(func.count(Exam.id)).where(
-            and_(Exam.user_id == user_id, Exam.status == "graded")
-        )
-    )
-    avg_score = await db.scalar(
-        select(func.avg(Exam.score)).where(
-            and_(Exam.user_id == user_id, Exam.status == "graded")
-        )
-    )
-
     # 作业/测试/考试（新组卷）统计
     total_papers = await db.scalar(
         select(func.count(PaperSubmission.id)).where(PaperSubmission.user_id == user_id)
@@ -153,9 +140,9 @@ async def get_my_stats(
         "not_helpful_count": not_helpful or 0,
         "helpful_rate": round(helpful / total_q, 2) if total_q else 0,
         "avg_kp_mastery": round(avg_mastery, 3) if avg_mastery else 0.5,
-        "total_exams": total_exams or 0,
-        "graded_exams": graded_exams or 0,
-        "avg_exam_score": round(avg_score, 1) if avg_score else None,
+        "total_exams": total_papers or 0,
+        "graded_exams": graded_papers or 0,
+        "avg_exam_score": round(avg_paper_score, 1) if avg_paper_score else None,
         "total_papers": total_papers or 0,
         "graded_papers": graded_papers or 0,
         "avg_paper_score": round(avg_paper_score, 1) if avg_paper_score else None,
@@ -170,6 +157,305 @@ async def get_my_stats(
             for r in recent
         ],
     }
+
+
+# ── Student: chapter mastery radar（按学科知识树的「章」划分） ──
+
+_CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+# 答疑对掌握度的单次权重。题目按难度（1-5）加权，答疑量远多于作业/测试，
+# 故答疑权重需显著低于题目权重，避免海量提问淹没少量作业结果。
+QA_WEIGHT = 0.2
+
+
+def _parse_chapter_no(text: str) -> int | None:
+    """从「第N章 xxx」中解析章号 N（支持阿拉伯数字与中文数字）。"""
+    if not text:
+        return None
+    m = re.search(r"第\s*([0-9一二三四五六七八九十百]+)\s*章", text)
+    if not m:
+        return None
+    s = m.group(1)
+    if s.isdigit():
+        return int(s)
+    if s == "十":
+        return 10
+    if s in _CN_DIGITS:
+        return _CN_DIGITS[s]
+    if "十" in s:
+        left, _, right = s.partition("十")
+        tens = _CN_DIGITS.get(left, 1)
+        ones = _CN_DIGITS.get(right, 0)
+        return tens * 10 + ones
+    return None
+
+
+def _chapter_key(title: str) -> str:
+    """去掉章标题的「第N章」前缀，得到用于匹配的内容部分。"""
+    return re.sub(r"^第\s*[0-9一二三四五六七八九十百]+\s*章\s*", "", title or "").strip()
+
+
+async def _compute_chapter_radar(db, user_id: int, subject_id: int):
+    """按学科知识树的章节计算学生掌握度（0-1，无证据默认 0.5）。
+
+    证据来源：
+      1) 作业/测试逐题结果：正确率（0-1）× 难度（1-5）加权；
+      2) 答疑反馈：helpful/未反馈=1.0 / not_helpful=0.0，权重 QA_WEIGHT（默认 0.2）。
+    题目按节（kp_id）归到其所属章；答疑按 matched_kps 的章标题归章。
+    """
+    from app.models import Paper, PaperAnswer, PaperQuestion, PaperSubmission, InteractionLog
+
+    DEFAULT_SCORE = 0.5
+
+    chapters = (await db.execute(
+        select(KnowledgePoint)
+        .where(KnowledgePoint.subject_id == subject_id, KnowledgePoint.level == 0)
+        .order_by(KnowledgePoint.sort_order, KnowledgePoint.id)
+    )).scalars().all()
+
+    if not chapters:
+        return {"subject_id": subject_id, "dimensions": [], "overall": DEFAULT_SCORE, "total_answered": 0}
+
+    by_id = {c.id: c for c in chapters}
+    by_no = {}
+    by_title = {}
+    for c in chapters:
+        m = re.search(r"(\d+)$", str(c.id))
+        if m:
+            by_no[int(m.group(1))] = c.id
+        key = _chapter_key(c.title)
+        if key:
+            by_title[key] = c.id
+
+    # 节 -> 章
+    sec_rows = (await db.execute(
+        select(KnowledgePoint).where(KnowledgePoint.parent_id.in_(list(by_id.keys())))
+    )).scalars().all()
+    kp_to_chapter = {s.id: s.parent_id for s in sec_rows}
+
+    agg = {cid: {"sum_score": 0.0, "sum_weight": 0.0, "answered": 0, "qa": 0, "qa_helpful": 0, "qa_not_helpful": 0} for cid in by_id}
+
+    # 1) 作业/测试逐题结果
+    stmt = (
+        select(PaperAnswer.score, PaperAnswer.is_correct, PaperQuestion.kp_id, PaperQuestion.difficulty)
+        .join(PaperSubmission, PaperAnswer.submission_id == PaperSubmission.id)
+        .join(PaperQuestion, PaperAnswer.paper_question_id == PaperQuestion.id)
+        .join(Paper, PaperSubmission.paper_id == Paper.id)
+        .where(and_(
+            PaperSubmission.user_id == user_id,
+            PaperSubmission.status == "submitted",
+            Paper.subject_id == subject_id,
+        ))
+    )
+    for score, is_correct, kp_id, difficulty in (await db.execute(stmt)).all():
+        cid = kp_to_chapter.get(kp_id)
+        if cid not in agg:
+            continue
+        s = score if score is not None else (1.0 if is_correct else 0.0)
+        if s is None:
+            continue
+        s = max(0.0, min(1.0, s))
+        w = float(difficulty or 3)
+        a = agg[cid]
+        a["sum_score"] += s * w
+        a["sum_weight"] += w
+        a["answered"] += 1
+
+    # 2) 答疑反馈（helpful/not_helpful）→ 章
+    logs = (await db.execute(
+        select(InteractionLog.matched_kps, InteractionLog.feedback)
+        .where(InteractionLog.user_id == user_id, InteractionLog.matched_kps.isnot(None))
+    )).all()
+    for matched_kps, feedback in logs:
+        if feedback == "not_helpful":
+            qa_score = 0.0
+        else:
+            qa_score = 1.0  # 有帮助 或 未反馈（默认视为有帮助）
+        entries = []
+        if isinstance(matched_kps, dict):
+            entries = matched_kps.get("chapters") or matched_kps.get("kps") or []
+        cids = set()
+        for e in entries:
+            if isinstance(e, dict):
+                kp_id = e.get("kp_id")
+                cid = kp_to_chapter.get(kp_id) or (kp_id if kp_id in by_id else None)
+                if cid:
+                    cids.add(cid)
+            elif isinstance(e, str):
+                no = _parse_chapter_no(e)
+                cid = by_no.get(no) if no else None
+                if not cid:
+                    cid = by_title.get(_chapter_key(e)) or (e.strip() if e.strip() in by_id else None)
+                if cid:
+                    cids.add(cid)
+        for cid in cids:
+            a = agg[cid]
+            a["sum_score"] += qa_score * QA_WEIGHT
+            a["sum_weight"] += QA_WEIGHT
+            a["qa"] += 1
+            if feedback == "helpful":
+                a["qa_helpful"] += 1
+            elif feedback == "not_helpful":
+                a["qa_not_helpful"] += 1
+
+    # 3) 汇总（无证据默认 0.5）
+    total_score = 0.0
+    total_weight = 0.0
+    total_answered = 0
+    dimensions = []
+    for c in chapters:
+        a = agg[c.id]
+        score = round(a["sum_score"] / a["sum_weight"], 3) if a["sum_weight"] else DEFAULT_SCORE
+        dimensions.append({
+            "id": c.id,
+            "name": c.title or c.id,
+            "score": score,
+            "answered": a["answered"],
+            "qa_count": a["qa"],
+            "qa_helpful": a["qa_helpful"],
+            "qa_not_helpful": a["qa_not_helpful"],
+        })
+        if a["sum_weight"]:
+            total_score += a["sum_score"]
+            total_weight += a["sum_weight"]
+            total_answered += a["answered"]
+
+    return {
+        "subject_id": subject_id,
+        "dimensions": dimensions,
+        "overall": round(total_score / total_weight, 3) if total_weight else DEFAULT_SCORE,
+        "total_answered": total_answered,
+    }
+
+
+@router.get("/chapter-radar")
+async def get_chapter_radar(
+    subject_id: int | None = None,
+    user_id: int | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """章节掌握雷达：维度 = 该学科知识树的各章，学生看自己，教师/管理员可指定 user_id。"""
+    target = current_user["user_id"]
+    if user_id is not None:
+        if current_user["role"] not in ("teacher", "admin"):
+            if user_id != target:
+                raise HTTPException(403, "只能查看自己的学情分析")
+        else:
+            target = user_id
+    if not subject_id:
+        subject_id = await db.scalar(select(Subject.id).order_by(Subject.id).limit(1))
+    if not subject_id:
+        return {"subject_id": None, "dimensions": [], "overall": 0.5, "total_answered": 0}
+    return await _compute_chapter_radar(db, target, subject_id)
+
+
+async def _compute_section_radar(db, user_id: int, subject_id: int, chapter_id: str):
+    """某章下各节的掌握度雷达（与章雷达同口径：作业测试正确率×难度 + 答疑反馈，无证据默认 0.5）。"""
+    from app.models import Paper, PaperAnswer, PaperQuestion, PaperSubmission, InteractionLog
+
+    DEFAULT_SCORE = 0.5
+    sections = (await db.execute(
+        select(KnowledgePoint)
+        .where(KnowledgePoint.subject_id == subject_id, KnowledgePoint.parent_id == chapter_id)
+        .order_by(KnowledgePoint.sort_order, KnowledgePoint.id)
+    )).scalars().all()
+    if not sections:
+        return {"chapter_id": chapter_id, "dimensions": [], "overall": DEFAULT_SCORE, "total_answered": 0}
+
+    sec_ids = [s.id for s in sections]
+    agg = {s.id: {"sum_score": 0.0, "sum_weight": 0.0, "answered": 0, "qa": 0, "qa_helpful": 0, "qa_not_helpful": 0} for s in sections}
+
+    # 1) 作业/测试逐题结果
+    stmt = (
+        select(PaperAnswer.score, PaperAnswer.is_correct, PaperQuestion.kp_id, PaperQuestion.difficulty)
+        .join(PaperSubmission, PaperAnswer.submission_id == PaperSubmission.id)
+        .join(PaperQuestion, PaperAnswer.paper_question_id == PaperQuestion.id)
+        .join(Paper, PaperSubmission.paper_id == Paper.id)
+        .where(and_(
+            PaperSubmission.user_id == user_id,
+            PaperSubmission.status == "submitted",
+            Paper.subject_id == subject_id,
+            PaperQuestion.kp_id.in_(sec_ids),
+        ))
+    )
+    for score, is_correct, kp_id, difficulty in (await db.execute(stmt)).all():
+        a = agg.get(kp_id)
+        if a is None:
+            continue
+        s = score if score is not None else (1.0 if is_correct else 0.0)
+        if s is None:
+            continue
+        s = max(0.0, min(1.0, s))
+        w = float(difficulty or 3)
+        a["sum_score"] += s * w
+        a["sum_weight"] += w
+        a["answered"] += 1
+
+    # 2) 答疑反馈（helpful/未反馈=1.0，not_helpful=0.0）→ 节
+    logs = (await db.execute(
+        select(InteractionLog.matched_kps, InteractionLog.feedback)
+        .where(InteractionLog.user_id == user_id, InteractionLog.matched_kps.isnot(None))
+    )).all()
+    for matched_kps, feedback in logs:
+        qa_score = 0.0 if feedback == "not_helpful" else 1.0
+        entries = matched_kps.get("sections") or [] if isinstance(matched_kps, dict) else []
+        for e in entries:
+            sid = e.get("kp_id") if isinstance(e, dict) else e
+            a = agg.get(sid)
+            if a is None:
+                continue
+            a["sum_score"] += qa_score * QA_WEIGHT
+            a["sum_weight"] += QA_WEIGHT
+            a["qa"] += 1
+            if feedback == "helpful":
+                a["qa_helpful"] += 1
+            elif feedback == "not_helpful":
+                a["qa_not_helpful"] += 1
+
+    # 3) 汇总（无证据默认 0.5）
+    total_score = 0.0
+    total_weight = 0.0
+    total_answered = 0
+    dimensions = []
+    for s in sections:
+        a = agg[s.id]
+        score = round(a["sum_score"] / a["sum_weight"], 3) if a["sum_weight"] else DEFAULT_SCORE
+        dimensions.append({
+            "id": s.id, "name": s.title or s.id, "score": score,
+            "answered": a["answered"], "qa_count": a["qa"],
+            "qa_helpful": a["qa_helpful"], "qa_not_helpful": a["qa_not_helpful"],
+        })
+        if a["sum_weight"]:
+            total_score += a["sum_score"]
+            total_weight += a["sum_weight"]
+            total_answered += a["answered"]
+
+    return {
+        "chapter_id": chapter_id,
+        "dimensions": dimensions,
+        "overall": round(total_score / total_weight, 3) if total_weight else DEFAULT_SCORE,
+        "total_answered": total_answered,
+    }
+
+
+@router.get("/section-radar")
+async def get_section_radar(
+    subject_id: int,
+    chapter_id: str,
+    user_id: int | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """某章各节的掌握度雷达（点击章名下钻）。"""
+    target = current_user["user_id"]
+    if user_id is not None:
+        if current_user["role"] not in ("teacher", "admin"):
+            if user_id != target:
+                raise HTTPException(403, "只能查看自己的学情分析")
+        else:
+            target = user_id
+    return await _compute_section_radar(db, target, subject_id, chapter_id)
 
 
 # ── Teacher: class dashboard ──
@@ -263,9 +549,9 @@ async def get_dashboard(
     )
 
     total_documents = await db.scalar(select(func.count(Document.id)))
-    total_exercises = await db.scalar(select(func.count(QuestionBank.id)))
+    total_exercises = await db.scalar(select(func.count(TestQuestion.id)))
     total_discussions = await db.scalar(select(func.count(Discussion.id)))
-    total_exams = await db.scalar(select(func.count(Exam.id)))
+    total_exams = await db.scalar(select(func.count(Paper.id)))
     total_interactions = await db.scalar(select(func.count(InteractionLog.id)))
     total_kps = await db.scalar(select(func.count(KnowledgePoint.id)))
     total_chunks = await db.scalar(select(func.count(ContentChunk.id)))
@@ -345,14 +631,16 @@ async def get_kp_stats(
     if not kp:
         return {"error": "Knowledge point not found", "kp_id": kp_id}
 
-    # Content chunks count
+    # Content chunks count（分块按 chunk_kp_map 归属章/节）
     chunk_count = await db.scalar(
-        select(func.count(ContentChunk.id)).where(ContentChunk.kp_id == kp_id)
+        select(func.count(ChunkKpMap.chunk_id)).where(
+            or_(ChunkKpMap.chapter_id == kp_id, ChunkKpMap.section_id == kp_id)
+        )
     )
 
-    # Exercise count（用检索题库 QuestionBank 统计）
+    # Exercise count（用独立试题库 TestQuestion 统计）
     ex_count = await db.scalar(
-        select(func.count(QuestionBank.id)).where(QuestionBank.kp_id == kp_id)
+        select(func.count(TestQuestion.id)).where(TestQuestion.kp_id == kp_id)
     )
 
     # Average mastery across users
@@ -365,9 +653,9 @@ async def get_kp_stats(
 
     # Exercise count by difficulty
     result = await db.execute(
-        select(QuestionBank.difficulty, func.count(QuestionBank.id))
-        .where(QuestionBank.kp_id == kp_id)
-        .group_by(QuestionBank.difficulty)
+        select(TestQuestion.difficulty, func.count(TestQuestion.id))
+        .where(TestQuestion.kp_id == kp_id)
+        .group_by(TestQuestion.difficulty)
     )
     diff_dist = {f"level_{row.difficulty}": row.count for row in result.all()}
 

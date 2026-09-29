@@ -1,6 +1,5 @@
 """User management API endpoints — CRUD, batch import, profile."""
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
-from openpyxl import load_workbook
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +26,7 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 @router.get("", response_model=PaginatedResponse)
 async def list_users(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=10000),
     role: str | None = None,
     class_name: str | None = None,
     search: str | None = None,
@@ -65,7 +64,7 @@ async def list_users(
 
     # Fetch page
     offset = (page - 1) * page_size
-    query = query.order_by(UserModel.created_at.desc()).offset(offset).limit(page_size)
+    query = query.order_by(UserModel.id.asc()).offset(offset).limit(page_size)
     result = await db.execute(query)
     users = result.scalars().all()
 
@@ -109,12 +108,17 @@ async def create_user(
     current_user: dict = Depends(get_admin_user),
 ):
     """手动创建单个用户（管理员）。"""
-    existing = await db.execute(select(UserModel).where(UserModel.username == data.username))
+    # 所有用户统一用学工号登录（用户名 = 学工号）
+    username = data.student_id or data.username
+    if not username:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请填写学工号")
+
+    existing = await db.execute(select(UserModel).where(UserModel.username == username))
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="学工号已存在")
 
     user = UserModel(
-        username=data.username,
+        username=username,
         password_hash=hash_password(data.password),
         real_name=data.real_name,
         role=data.role,
@@ -180,8 +184,12 @@ async def update_user(
     # Permission check
     if current_user["role"] != "admin" and current_user["user_id"] != user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权修改此用户")
-    if current_user["role"] != "admin" and (data.role is not None or data.is_active is not None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有管理员可以修改角色或状态")
+    if current_user["role"] != "admin":
+        # 非管理员只能改自己的基础信息（姓名等），不能改角色/状态/班级/学工号
+        if data.role is not None or data.is_active is not None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有管理员可以修改角色或状态")
+        if data.class_name is not None or data.student_id is not None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有管理员可以修改班级或学工号")
 
     update_data = data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -261,56 +269,96 @@ async def reset_user_password(
 @router.post("/import-excel", response_model=ImportResult)
 async def import_users_excel(
     file: UploadFile,
+    subject_id: int = Form(...),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_admin_user),
 ):
-    """Batch import users from Excel (admin only).
-    Expected columns: 用户名 | 真实姓名 | 角色 | 班级 | 学号 | 密码(可选)
+    """批量导入学生（仅学生，自动分配到指定学科）。
+
+    按列名自动识别：姓名 / 学号 / 班级。
+    支持 .xls / .xlsx / .xlsm / .csv。
     """
-    if not file.filename.endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="仅支持 .xlsx / .xls 文件")
+    import io
+    import pandas as pd
 
+    filename = (file.filename or "").lower()
     contents = await file.read()
-    wb = load_workbook(contents, data_only=True)
-    ws = wb.active
 
-    rows = list(ws.iter_rows(min_row=2, values_only=True))  # skip header
-    total = len(rows)
+    def _read_df():
+        if filename.endswith(".xls"):
+            return pd.read_excel(io.BytesIO(contents), engine="xlrd", dtype=str)
+        if filename.endswith((".xlsx", ".xlsm")):
+            return pd.read_excel(io.BytesIO(contents), engine="openpyxl", dtype=str)
+        if filename.endswith(".csv"):
+            for enc in ("utf-8-sig", "gbk", "utf-8"):
+                try:
+                    return pd.read_csv(io.BytesIO(contents), encoding=enc, dtype=str)
+                except UnicodeDecodeError:
+                    continue
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无法识别 CSV 编码")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="仅支持 .xls / .xlsx / .xlsm / .csv 文件")
+
+    try:
+        df = _read_df()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"无法解析表格: {e}")
+
+    def _find_col(*keywords):
+        for col in df.columns:
+            c = str(col)
+            if any(k in c for k in keywords):
+                return col
+        return None
+
+    col_name = _find_col("姓名", "名字")
+    col_sid = _find_col("学号", "学工号")
+    col_class = _find_col("班级")
+
+    if col_name is None or col_sid is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="表格缺少「姓名」或「学工号」列")
+
+    def _clean(v):
+        s = str(v if v is not None else "").strip()
+        return "" if s.lower() in ("nan", "none", "nat") else s
+
     success = 0
+    total = 0
     errors = []
 
-    for i, row in enumerate(rows, start=2):
-        if not row or not row[0]:
+    for i, row in df.iterrows():
+        name = _clean(row[col_name])
+        sid = _clean(row[col_sid])
+        if not name or not sid:
+            continue
+        if sid.endswith(".0"):
+            sid = sid[:-2]
+        total += 1
+
+        class_name = _clean(row[col_class]) if col_class else ""
+
+        username = sid  # 学工号作为登录名
+        existing = await db.scalar(select(UserModel).where(UserModel.username == username))
+        if existing:
+            errors.append(f"第{i + 2}行: 学工号'{sid}'已存在")
             continue
         try:
-            username = str(row[0]).strip()
-            real_name = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-            role = str(row[2]).strip() if len(row) > 2 and row[2] else "student"
-            class_name = str(row[3]).strip() if len(row) > 3 and row[3] else None
-            student_id = str(row[4]).strip() if len(row) > 4 and row[4] else None
-            password = str(row[5]).strip() if len(row) > 5 and row[5] else "123456"
-
-            if role not in ("student", "teacher", "admin"):
-                errors.append(f"行{i}: 无效角色'{role}'")
-                continue
-
-            existing = await db.execute(select(UserModel).where(UserModel.username == username))
-            if existing.scalar_one_or_none():
-                errors.append(f"行{i}: 用户名'{username}'已存在")
-                continue
-
             user = UserModel(
                 username=username,
-                password_hash=hash_password(password),
-                real_name=real_name,
-                role=role,
-                class_name=class_name,
-                student_id=student_id,
+                password_hash=hash_password(sid),   # 默认密码 = 学工号
+                real_name=name,
+                role="student",                      # 只能是学生
+                class_name=class_name or None,
+                student_id=sid,
             )
             db.add(user)
+            await db.flush()
+            db.add(UserSubject(user_id=user.id, subject_id=subject_id))
+            await db.commit()   # 每个学生提交一次，避免长时间占用 SQLite 写锁
             success += 1
         except Exception as e:
-            errors.append(f"行{i}: {str(e)}")
+            await db.rollback()  # 清除失败事务（如数据库锁），继续下一个
+            errors.append(f"第{i + 2}行: {str(e)}")
 
-    await db.flush()
     return ImportResult(total=total, success=success, failed=total - success, errors=errors)

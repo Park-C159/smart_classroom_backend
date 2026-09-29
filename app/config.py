@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     DEEPSEEK_CHAT_MODEL: str = "deepseek-v4-pro"
     DEEPSEEK_REASONER_MODEL: str = "deepseek-v4-pro"
 
+    # ── 抽题答案 LLM 校验 ──
+    LLM_VERIFY_ANSWERS: bool = True  # 抽取题目后用 LLM 校验/修正答案（关闭可加速批量抽取）
+
     # ── 联网搜索（百度 AI 搜索 API）──
     BAIDU_SEARCH_API_KEY: str = ""   # 百度智能云 API Key；为空时回退 Bing 抓取
 
@@ -50,6 +53,7 @@ class Settings(BaseSettings):
 
     # ── MinerU ──
     MINERU_MODE: str = "high-quality"  # high-quality | fast
+    MINERU_BACKEND: str = "pipeline"   # 解析后端：pipeline（快，OCR+公式+表格，不用 VLM）| hybrid-engine（VLM，质量高但慢且吃显存）
     MINERU_API_URL: str = ""           # 常驻 mineru-api 服务地址（如 http://127.0.0.1:8002）；空则每次起临时服务
     MINERU_BIN: str = ""               # mineru CLI 路径（MinerU 独立环境）；空则自动检测
     MINERU_API_BIN: str = ""           # mineru-api 路径（MinerU 独立环境）；空则自动检测
@@ -62,6 +66,10 @@ class Settings(BaseSettings):
     RAG_MAX_CANDIDATES: int = 8        # max candidates entering reranker
     RAG_RERANK_TOP_K: int = 5          # final top-K after reranker
     CHAT_HISTORY_ROUNDS: int = 3       # conversation rounds injected into prompt
+
+    # ── 分块（滑窗） ──
+    CHUNK_SIZE: int = 1000             # 滑窗分块大小（字符，数学公式较多取大些）
+    CHUNK_OVERLAP: int = 200           # 相邻块重叠（字符）
 
     # ── Upload ──
     MAX_UPLOAD_SIZE_MB: int = 500      # PDF max size

@@ -270,19 +270,17 @@ class RAGService:
         """
         from sqlalchemy import select
         from app.core.database import async_session_factory
-        from app.models import KnowledgePoint, ContentChunk, Exercise
+        from app.models import KnowledgePoint, ContentChunk
 
-        kps, chunks, exercises_list = [], [], []
+        kps, chunks = [], []
         async with async_session_factory() as db:
             result = await db.execute(select(KnowledgePoint))
             kps = result.scalars().all()
             result = await db.execute(select(ContentChunk))
             chunks = result.scalars().all()
-            result = await db.execute(select(Exercise).where(Exercise.faiss_id.is_(None)))
-            exercises_list = result.scalars().all()
 
         # Build KP index
-        kp_entries, content_entries, exercise_entries = [], [], []
+        kp_entries, content_entries = [], []
 
         # KP summaries for stage-1 coarse retrieval
         for kp in kps:
@@ -306,17 +304,6 @@ class RAGService:
                 "page_num": chunk.page_number,
             })
             chunk.faiss_id = i
-
-        # Exercises for stage-2 exercise retrieval
-        for i, ex in enumerate(exercises_list):
-            exercise_entries.append({
-                "exercise_id": ex.id,
-                "kp_id": ex.kp_id,
-                "text": ex.question_text,
-                "doc_id": doc_id,
-                "page_num": ex.page_number,
-            })
-            ex.faiss_id = i
 
         data_dir = self._parsed_dir(doc_id)
 
@@ -344,27 +331,14 @@ class RAGService:
             with open(data_dir / "faiss_content_meta.json", "w", encoding="utf-8") as f:
                 json.dump(content_entries, f, ensure_ascii=False)
 
-        # Build and save exercise index
-        if exercise_entries:
-            ex_embs = self.embedding_model.encode(
-                [e["text"] for e in exercise_entries], normalize_embeddings=True
-            )
-            ex_dim = ex_embs.shape[1]
-            ex_index = faiss.IndexFlatIP(ex_dim)
-            ex_index.add(ex_embs.astype("float32"))
-            faiss.write_index(ex_index, str(data_dir / "faiss_exercise.index"))
-            with open(data_dir / "faiss_exercise_meta.json", "w", encoding="utf-8") as f:
-                json.dump(exercise_entries, f, ensure_ascii=False)
-
         logger.info(
-            "Two-stage indices built: KPs=%d, content=%d, exercises=%d",
-            len(kp_entries), len(content_entries), len(exercise_entries),
+            "Two-stage indices built: KPs=%d, content=%d",
+            len(kp_entries), len(content_entries),
         )
         return {
             "doc_id": doc_id,
             "kp_chunks": len(kp_entries),
             "content_chunks": len(content_entries),
-            "exercise_chunks": len(exercise_entries),
         }
 
     async def build_subject_indices(self, subject_id: int, db=None) -> Dict[str, Any]:
@@ -375,7 +349,7 @@ class RAGService:
         import os as _os
         from sqlalchemy import select
         from app.core.database import async_session_factory
-        from app.models import KnowledgePoint, ContentChunk, Exercise
+        from app.models import KnowledgePoint, ContentChunk
 
         should_close = db is None
         if db is None:
@@ -383,11 +357,17 @@ class RAGService:
 
         try:
             # Collect all KPs, content chunks, exercises for this subject
-            # (all KPs are subject-scoped; content and exercises linked via kp_id)
-            kps = (await db.execute(select(KnowledgePoint))).scalars().all()
-            chunks = (await db.execute(select(ContentChunk))).scalars().all()
-            exercises_list = (await db.execute(select(Exercise))).scalars().all()
-
+            # 分块/习题按「书 → 库」归集（document_subjects），手动内容回退 subject_id
+            doc_ids = await self._subject_doc_ids(db, subject_id, "kb")
+            kps = (await db.execute(
+                select(KnowledgePoint).where(KnowledgePoint.subject_id == subject_id)
+            )).scalars().all()
+            chunks = (await db.execute(
+                select(ContentChunk).where(
+                    ContentChunk.source_doc_id.in_(doc_ids)
+                    | ((ContentChunk.source_doc_id.is_(None)) & (ContentChunk.subject_id == subject_id))
+                )
+            )).scalars().all()
             store_dir = Path(settings.DATA_DIR) / "vector_store" / str(subject_id)
             store_dir.mkdir(parents=True, exist_ok=True)
 
@@ -425,34 +405,14 @@ class RAGService:
                 with open(store_dir / "faiss_content_meta.json", "w", encoding="utf-8") as f:
                     json.dump(content_entries, f, ensure_ascii=False)
 
-            # Exercise index
-            ex_entries = []
-            for i, ex in enumerate(exercises_list):
-                text = (ex.embedding_text or ex.question_text)[:512]
-                ex_entries.append({
-                    "id": ex.id, "kp_id": ex.kp_id, "text": text,
-                    "question_type": ex.question_type, "faiss_id": i,
-                    "page_num": ex.page_number,
-                })
-            if ex_entries:
-                embs = self.embedding_model.encode(
-                    [e["text"] for e in ex_entries], normalize_embeddings=True
-                )
-                idx = faiss.IndexFlatIP(embs.shape[1])
-                idx.add(embs.astype("float32"))
-                faiss.write_index(idx, str(store_dir / "faiss_exercise.index"))
-                with open(store_dir / "faiss_exercise_meta.json", "w", encoding="utf-8") as f:
-                    json.dump(ex_entries, f, ensure_ascii=False)
-
             logger.info(
-                "Subject indices built (subject=%d): KPs=%d, content=%d, exercises=%d",
-                subject_id, len(kp_entries), len(content_entries), len(ex_entries),
+                "Subject indices built (subject=%d): KPs=%d, content=%d",
+                subject_id, len(kp_entries), len(content_entries),
             )
             return {
                 "subject_id": subject_id,
                 "kp_chunks": len(kp_entries),
                 "content_chunks": len(content_entries),
-                "exercise_chunks": len(ex_entries),
             }
         finally:
             if should_close and db:
@@ -474,9 +434,13 @@ class RAGService:
             store_dir = Path(settings.DATA_DIR) / "vector_store" / str(subject_id)
             store_dir.mkdir(parents=True, exist_ok=True)
 
-            # Get all KB chunks with subject_id
+            # Get all KB chunks：按「书 → 库」归集，手动分块回退 subject_id
+            doc_ids = await self._subject_doc_ids(db, subject_id, "kb")
             chunks = (await db.execute(
-                select(ContentChunk).where(ContentChunk.subject_id == subject_id)
+                select(ContentChunk).where(
+                    ContentChunk.source_doc_id.in_(doc_ids)
+                    | ((ContentChunk.source_doc_id.is_(None)) & (ContentChunk.subject_id == subject_id))
+                )
             )).scalars().all()
 
             kb_entries = []
@@ -504,102 +468,405 @@ class RAGService:
             if should_close and db:
                 await db.close()
 
-    async def build_qb_index(self, subject_id: int, db=None) -> Dict[str, Any]:
-        """Build question bank FAISS index: question_bank entries grouped by chapter."""
-        import os as _os
+    def _subject_index_dir(self, subject_id: int) -> Path:
+        return Path(settings.DATA_DIR) / "vector_store" / str(subject_id)
+
+    async def _subject_doc_ids(self, db, subject_id: int, library: str = "kb") -> list[int]:
+        """返回某学科「知识库/题库」下所有书籍的 document_id（document_subjects + in_kb/in_qb）。"""
+        from sqlalchemy import select
+        from app.models import DocumentSubject
+        col = DocumentSubject.in_kb if library == "kb" else DocumentSubject.in_qb
+        rows = await db.execute(
+            select(DocumentSubject.document_id).where(
+                DocumentSubject.subject_id == subject_id,
+                col.is_(True),
+            )
+        )
+        return [r[0] for r in rows.all() if r[0] is not None]
+
+    @staticmethod
+    async def _ingest_document_chunks(db, doc_id: int, subject_id: int) -> int:
+        """把文档解析结果用「滑动窗口」切成扁平分块，写入 content_chunks。"""
+        import ast
+        from sqlalchemy import delete
+        from app.models import ContentChunk
+
+        result_file = Path(settings.DATA_DIR) / "parsed" / str(doc_id) / "result.json"
+        if not result_file.exists():
+            logger.warning("文档 %d 无解析结果 result.json，跳过切块", doc_id)
+            return 0
+        with open(result_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw_data = data.get("raw_data", [])
+
+        content_types = {"title", "paragraph", "equation_interline", "list", "text", "equation"}
+
+        def _y(bbox):
+            try:
+                arr = ast.literal_eval(bbox) if isinstance(bbox, str) else (bbox or [])
+                return float(arr[1]) if len(arr) > 1 else 0.0
+            except Exception:
+                return 0.0
+
+        # 收集有效内容并按 (页码, 纵坐标) 排序
+        items = []
+        for it in raw_data:
+            if it.get("type") not in content_types or not it.get("text"):
+                continue
+            try:
+                page_idx = int(it.get("page_idx", 0))
+            except (TypeError, ValueError):
+                page_idx = 0
+            items.append((page_idx, _y(it.get("bbox")), it))
+        items.sort(key=lambda x: (x[0], x[1]))
+
+        # 按页拼成文本（公式包 $$...$$），并记录每页起始偏移
+        page_texts = []  # [(page_num, text)]
+        cur_page = None
+        cur_parts = []
+        for page_idx, _, it in items:
+            t = (it.get("text") or "").strip()
+            if not t:
+                continue
+            if it.get("type") in ("equation_interline", "equation"):
+                t = f"$$\n{t}\n$$"
+            if cur_page is None:
+                cur_page = page_idx
+            elif page_idx != cur_page:
+                page_texts.append((cur_page + 1, "\n\n".join(cur_parts).strip()))
+                cur_page = page_idx
+                cur_parts = []
+            cur_parts.append(t)
+        if cur_page is not None:
+            page_texts.append((cur_page + 1, "\n\n".join(cur_parts).strip()))
+
+        # 拼接全文 + 页号映射
+        full_text = ""
+        page_map = []  # [(offset, page_num)]
+        for pn, text in page_texts:
+            if not text:
+                continue
+            page_map.append((len(full_text), pn))
+            full_text += text + "\n\n"
+
+        chunk_size = settings.CHUNK_SIZE
+        overlap = settings.CHUNK_OVERLAP
+        step = max(1, chunk_size - overlap)
+        n = len(full_text)
+
+        await db.execute(delete(ContentChunk).where(ContentChunk.source_doc_id == doc_id))
+
+        count = 0
+        start = 0
+        while start < n:
+            end = min(start + chunk_size, n)
+            text = full_text[start:end].strip()
+            if text:
+                pn = 1
+                for off, p in page_map:
+                    if off <= start:
+                        pn = p
+                    else:
+                        break
+                db.add(ContentChunk(
+                    kp_id="flat",
+                    chunk_type="text",
+                    content=text,
+                    page_number=pn,
+                    subject_id=subject_id,
+                    source_doc_id=doc_id,
+                ))
+                count += 1
+            if end >= n:
+                break
+            start += step
+        await db.flush()
+        logger.info("文档 %d 滑窗切块 %d 个 (size=%d, overlap=%d)", doc_id, count, chunk_size, overlap)
+        return count
+
+    async def _load_chunk_meta_entries(self, db, subject_id: int) -> list:
+        """组装 chunk_meta.json 的条目（含章/节映射），不做向量嵌入。"""
+        from sqlalchemy import select
+        from app.models import ContentChunk, KnowledgePoint, ChunkKpMap
+
+        doc_ids = await self._subject_doc_ids(db, subject_id, "kb")
+        chunks = (await db.execute(
+            select(ContentChunk).where(
+                ContentChunk.source_doc_id.in_(doc_ids)
+                | ((ContentChunk.source_doc_id.is_(None)) & (ContentChunk.subject_id == subject_id))
+            )
+        )).scalars().all()
+
+        map_rows = (await db.execute(
+            select(ChunkKpMap).where(ChunkKpMap.subject_id == subject_id)
+        )).scalars().all()
+        m_by_chunk = {m.chunk_id: m for m in map_rows}
+
+        ch_rows = (await db.execute(
+            select(KnowledgePoint).where(
+                KnowledgePoint.subject_id == subject_id, KnowledgePoint.level == 0
+            )
+        )).scalars().all()
+        ch_title = {c.id: c.title for c in ch_rows}
+        sec_rows = (await db.execute(
+            select(KnowledgePoint).where(
+                KnowledgePoint.subject_id == subject_id, KnowledgePoint.level == 1
+            )
+        )).scalars().all()
+        sec_title = {s.id: s.title for s in sec_rows}
+
+        entries = []
+        for i, c in enumerate(chunks):
+            m = m_by_chunk.get(c.id)
+            chapter_id = (m.chapter_id if m and m.chapter_id
+                          else (c.kp_id if c.kp_id and c.kp_id != "flat" else None))
+            section_id = m.section_id if m and m.section_id else None
+            entries.append({
+                "chunk_id": c.id,
+                "kp_id": chapter_id or "flat",
+                "chapter_id": chapter_id,
+                "chapter_title": ch_title.get(chapter_id, "") if chapter_id else "",
+                "section_id": section_id,
+                "section_title": sec_title.get(section_id, "") if section_id else "",
+                "text": (c.content or "")[:512],
+                "full_text": c.content or "",
+                "page_number": c.page_number,
+                "source_doc_id": c.source_doc_id,
+                "faiss_id": i,
+            })
+        return entries
+
+    async def _write_chunk_meta(self, db, subject_id: int) -> int:
+        """重写 chunk_meta.json（不含向量，用于知识树变动后的局部更新）。"""
+        entries = await self._load_chunk_meta_entries(db, subject_id)
+        store_dir = self._subject_index_dir(subject_id)
+        store_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = store_dir / "chunk_meta.json"
+        if entries:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(entries, f, ensure_ascii=False)
+        elif meta_path.exists():
+            meta_path.unlink()
+        return len(entries)
+
+    async def build_chunk_index(self, subject_id: int, db=None) -> Dict[str, Any]:
+        """构建知识库分块索引：先按内容相似度把分块匹配到知识树的章/节，再建向量索引。"""
         from sqlalchemy import select
         from app.core.database import async_session_factory
-        from app.models import QuestionBank
+        from app.models import ContentChunk
 
         should_close = db is None
         if db is None:
             db = async_session_factory()
         try:
-            store_dir = Path(settings.DATA_DIR) / "vector_store" / str(subject_id)
+            doc_ids = await self._subject_doc_ids(db, subject_id, "kb")
+            # 按需切块：仅对还没有分块的书执行
+            if doc_ids:
+                existing = set((await db.execute(
+                    select(ContentChunk.source_doc_id)
+                    .where(ContentChunk.source_doc_id.in_(doc_ids))
+                    .distinct()
+                )).scalars().all())
+                for did in doc_ids:
+                    if did not in existing:
+                        await self._ingest_document_chunks(db, did, subject_id)
+
+            # 分块 → 章/节（全量匹配，写入 chunk_kp_map）
+            await self.match_chunks_to_chapters(db, subject_id)
+
+            entries = await self._load_chunk_meta_entries(db, subject_id)
+            store_dir = self._subject_index_dir(subject_id)
             store_dir.mkdir(parents=True, exist_ok=True)
 
-            qs = (await db.execute(
-                select(QuestionBank).where(QuestionBank.subject_id == subject_id)
-            )).scalars().all()
-
-            qb_entries = []
-            for i, q in enumerate(qs):
-                text = (q.embedding_text or q.question_text)[:512]
-                qb_entries.append({
-                    "id": q.id, "chapter": q.chapter, "text": text,
-                    "question_type": q.question_type, "faiss_id": i,
-                    "page_num": q.page_number, "source_doc_id": q.source_doc_id,
-                    "source": q.source,
-                    "question_text": (q.question_text or "")[:1000],
-                    "answer_text": (q.answer_text or "")[:2000],
-                })
-
-            if qb_entries:
+            idx_path = store_dir / "faiss_chunk.index"
+            meta_path = store_dir / "chunk_meta.json"
+            if entries:
                 embs = self.embedding_model.encode(
-                    [e["text"] for e in qb_entries], normalize_embeddings=True
+                    [e["text"] for e in entries], normalize_embeddings=True
                 )
                 idx = faiss.IndexFlatIP(embs.shape[1])
                 idx.add(embs.astype("float32"))
-                faiss.write_index(idx, str(store_dir / "faiss_qb.index"))
-                with open(store_dir / "faiss_qb_meta.json", "w", encoding="utf-8") as f:
-                    json.dump(qb_entries, f, ensure_ascii=False)
+                faiss.write_index(idx, str(idx_path))
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(entries, f, ensure_ascii=False)
+            else:
+                for p in (idx_path, meta_path):
+                    if p.exists():
+                        p.unlink()
 
-            logger.info("QB index: %d questions (subject=%d)", len(qb_entries), subject_id)
-            return {"qb_questions": len(qb_entries)}
+            logger.info("KB chunk index built (subject=%d): chunks=%d", subject_id, len(entries))
+            return {"subject_id": subject_id, "chunks": len(entries)}
         finally:
             if should_close and db:
                 await db.close()
 
-    def search_qb(
-        self, query: str, subject_id: int, top_k: int = 3, chapter_filter: str = None,
-    ) -> List[Dict[str, Any]]:
-        """Search question bank FAISS index for similar exercises.
+    def has_chunk_index(self, subject_id: int) -> bool:
+        """判断某学科的知识库分块索引是否存在。"""
+        return (self._subject_index_dir(subject_id) / "faiss_chunk.index").exists()
 
-        Returns entries with question_text, answer_text for LLM reference.
+    async def match_chunks_to_chapters(self, db, subject_id: int, chunk_ids=None) -> Dict[str, Any]:
+        """把学科知识库分块按内容相似度匹配到知识树的章/节，写入 chunk_kp_map。
+
+        每章 profile = 章标题 + 摘要 + 各节标题；分块与各章算余弦相似度取最高章，
+        再在该章内选最相近的节。chunk_ids 指定时只重匹配这些块（None = 全部）。
         """
-        store_dir = self._subject_index_dir(subject_id)
-        idx_path = store_dir / "faiss_qb.index"
-        meta_path = store_dir / "faiss_qb_meta.json"
+        from sqlalchemy import select, delete
+        from app.models import ContentChunk, KnowledgePoint, ChunkKpMap
 
+        chapters = (await db.execute(
+            select(KnowledgePoint)
+            .where(KnowledgePoint.subject_id == subject_id, KnowledgePoint.level == 0)
+            .order_by(KnowledgePoint.sort_order, KnowledgePoint.id)
+        )).scalars().all()
+        if not chapters:
+            return {"subject_id": subject_id, "matched": 0, "unmatched": 0, "total": 0, "chapters": 0}
+
+        chapter_ids = [c.id for c in chapters]
+        sections = (await db.execute(
+            select(KnowledgePoint).where(KnowledgePoint.parent_id.in_(chapter_ids))
+        )).scalars().all()
+        sec_by_ch: Dict[str, list] = {}
+        for s in sections:
+            sec_by_ch.setdefault(s.parent_id, []).append(s)
+
+        def _profile(c) -> str:
+            parts = [c.title or ""]
+            parts += [s.title for s in sec_by_ch.get(c.id, []) if s.title]
+            if c.summary:
+                parts.append(c.summary)
+            return "\n".join(p for p in parts if p)
+
+        profiles = [_profile(c) or c.id for c in chapters]
+
+        doc_ids = await self._subject_doc_ids(db, subject_id, "kb")
+        if not doc_ids:
+            return {"subject_id": subject_id, "matched": 0, "unmatched": 0, "total": 0, "chapters": len(chapters)}
+
+        q = select(ContentChunk).where(
+            ContentChunk.source_doc_id.in_(doc_ids)
+            | ((ContentChunk.source_doc_id.is_(None)) & (ContentChunk.subject_id == subject_id))
+        )
+        if chunk_ids:
+            q = q.where(ContentChunk.id.in_(chunk_ids))
+        chunks = (await db.execute(q)).scalars().all()
+        if not chunks:
+            return {"subject_id": subject_id, "matched": 0, "unmatched": 0, "total": 0, "chapters": len(chapters)}
+
+        prof_embs = self.embedding_model.encode(profiles, normalize_embeddings=True)
+        chunk_embs = self.embedding_model.encode(
+            [(c.content or "")[:2048] for c in chunks], normalize_embeddings=True
+        )
+
+        # 节级 profile（在选中的章内选节）
+        sec_chapters: list[str] = []
+        sec_ids: list[str] = []
+        sec_profiles: list[str] = []
+        for ch in chapters:
+            for s in sec_by_ch.get(ch.id, []):
+                sec_chapters.append(ch.id)
+                sec_ids.append(s.id)
+                sec_profiles.append("\n".join(p for p in [s.title or "", s.summary or ""] if p) or s.id)
+        sec_embs = None
+        if sec_profiles:
+            sec_embs = self.embedding_model.encode(sec_profiles, normalize_embeddings=True)
+
+        import numpy as np
+        sims = chunk_embs @ prof_embs.T
+        best_idx = sims.argmax(axis=1)
+        best_sim = sims.max(axis=1)
+
+        chapter_threshold = 0.15
+        section_threshold = 0.25
+        matched = 0
+        unmatched = 0
+        for i, c in enumerate(chunks):
+            j = int(best_idx[i])
+            sim = float(best_sim[i])
+            if sim < chapter_threshold:
+                c.kp_id = "flat"
+                await db.execute(delete(ChunkKpMap).where(ChunkKpMap.chunk_id == c.id))
+                unmatched += 1
+                continue
+            chapter_id = chapters[j].id
+            section_id = None
+            if sec_embs is not None:
+                idx_list = [k for k in range(len(sec_chapters)) if sec_chapters[k] == chapter_id]
+                if idx_list:
+                    sub = sec_embs[idx_list] @ chunk_embs[i]
+                    k = int(sub.argmax())
+                    if float(sub[k]) >= section_threshold:
+                        section_id = sec_ids[idx_list[k]]
+
+            c.kp_id = chapter_id  # 冗余一份到 content_chunks，兼容旧接口
+            row = await db.get(ChunkKpMap, c.id)
+            if row:
+                row.subject_id = subject_id
+                row.chapter_id = chapter_id
+                row.section_id = section_id
+                row.similarity = sim
+            else:
+                db.add(ChunkKpMap(
+                    chunk_id=c.id, subject_id=subject_id,
+                    chapter_id=chapter_id, section_id=section_id, similarity=sim,
+                ))
+            matched += 1
+
+        await db.flush()
+        logger.info(
+            "分块匹配章节: subject=%d matched=%d unmatched=%d avg_sim=%.3f",
+            subject_id, matched, unmatched, float(best_sim.mean()),
+        )
+        return {
+            "subject_id": subject_id,
+            "matched": matched,
+            "unmatched": unmatched,
+            "total": len(chunks),
+            "chapters": len(chapters),
+            "avg_sim": round(float(best_sim.mean()), 3),
+        }
+
+    def retrieve_chunks(self, query: str, subject_id: int, top_k: int = 5) -> List[Dict[str, Any]]:
+        """扁平知识库检索：向量召回 → rerank → top_k。"""
+        store_dir = self._subject_index_dir(subject_id)
+        idx_path = store_dir / "faiss_chunk.index"
+        meta_path = store_dir / "chunk_meta.json"
         if not idx_path.exists() or not meta_path.exists():
-            logger.warning("QB index not found at %s", store_dir)
+            logger.warning("Chunk index not found at %s", idx_path)
             return []
 
         with open(meta_path, "r", encoding="utf-8") as f:
-            qb_meta = json.load(f)
+            meta = json.load(f)
+        if not meta:
+            return []
+        index = faiss.read_index(str(idx_path))
 
-        if not qb_meta:
+        query_emb = self.embedding_model.encode([query], normalize_embeddings=True)
+        search_k = min(settings.RAG_MAX_CANDIDATES * 3, index.ntotal)
+        scores, indices = index.search(query_emb.astype("float32"), search_k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if 0 <= idx < len(meta):
+                m = dict(meta[idx])
+                m["score"] = float(score)
+                m["source"] = "kb"
+                results.append(m)
+            if len(results) >= settings.RAG_MAX_CANDIDATES:
+                break
+
+        if not results:
             return []
 
-        idx = faiss.read_index(str(idx_path))
-        query_emb = self.embedding_model.encode([query], normalize_embeddings=True)
-        search_k = min(top_k * 5, idx.ntotal)
-        scores, indices = idx.search(query_emb.astype("float32"), search_k)
-
-        # 收集全部候选再重排（不提前截断到 top_k，提升召回）
-        results = []
-        for score, fi in zip(scores[0], indices[0]):
-            if 0 <= fi < len(qb_meta):
-                meta = dict(qb_meta[fi])
-                if chapter_filter and meta.get("chapter") != chapter_filter:
-                    continue
-                meta["score"] = float(score)
-                results.append(meta)
-
-        # Rerank if we have enough candidates
         if len(results) > 1:
             try:
-                rerank_scores = self._rerank_scores(query, [r["text"] for r in results])
-                for i, s in enumerate(rerank_scores):
+                rs = self._rerank_scores(query, [r["text"] for r in results[:12]])
+                for i, s in enumerate(rs):
                     results[i]["rerank_score"] = float(s)
                 results.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
             except Exception as e:
-                logger.warning("QB rerank failed: %s", e)
+                logger.warning("rerank failed: %s", e)
 
         return results[:top_k]
-
-    def _subject_index_dir(self, subject_id: int) -> Path:
-        return Path(settings.DATA_DIR) / "vector_store" / str(subject_id)
 
     def _load_subject_indices(self, subject_id: int) -> Dict[str, Any]:
         """Load per-subject two-stage indices."""
@@ -658,7 +925,9 @@ class RAGService:
             if doc_id:
                 indices = self._load_knowledge_indices(doc_id)
         if not indices or not indices.get("kp"):
-            return self.retrieve(query, top_k) if doc_id else []
+            if doc_id and self.load_index(doc_id):
+                return self.retrieve(query, top_k)
+            return []
 
         if indices["kp"] is None:
             # Fall back to single-index retrieval
@@ -702,25 +971,8 @@ class RAGService:
                             "score": float(score),
                         })
 
-        exercise_candidates = []
-        if indices["exercise"] is not None and indices["exercise_meta"]:
-            ex_pool = min(settings.RAG_EXERCISE_CANDIDATES, len(indices["exercise_meta"]))
-            ex_scores, ex_indices = indices["exercise"].search(
-                query_emb.astype("float32"), ex_pool
-            )
-            for score, idx in zip(ex_scores[0], ex_indices[0]):
-                if 0 <= idx < len(indices["exercise_meta"]):
-                    meta = indices["exercise_meta"][idx]
-                    if matched_kp_ids and meta["kp_id"] in matched_kp_ids:
-                        exercise_candidates.append({
-                            **meta, "source": "exercise",
-                            "score": float(score),
-                        })
-
-        # Merge: content first, then exercises, deduplicate, cap at max_candidates
-        candidates = content_candidates[:5] + exercise_candidates[:3]
-        if len(candidates) > max_candidates:
-            candidates = candidates[:max_candidates]
+        # Merge: content first, cap at max_candidates
+        candidates = content_candidates[:max_candidates]
         if len(candidates) < top_k and not matched_kp_ids:
             # No KP match — add content results unfiltered
             for score, idx in zip(ct_scores[0], ct_indices[0]):
@@ -730,8 +982,8 @@ class RAGService:
                 if len(candidates) >= max_candidates:
                     break
 
-        logger.info("Stage 2: %d candidates (content=%d, exercise=%d)",
-                     len(candidates), len(content_candidates), len(exercise_candidates))
+        logger.info("Stage 2: %d candidates (content=%d)",
+                     len(candidates), len(content_candidates))
 
         if not candidates:
             return []
@@ -790,12 +1042,19 @@ class RAGService:
             db = async_session_factory()
 
         try:
-            # Load all KPs and chunks
+            # Load all KPs and chunks for this subject
+            # 分块按「书 → 库」归集，手动分块回退 subject_id
+            doc_ids = await self._subject_doc_ids(db, subject_id, "kb")
             kps = (await db.execute(
-                select(KnowledgePoint).order_by(KnowledgePoint.sort_order)
+                select(KnowledgePoint)
+                .where(KnowledgePoint.subject_id == subject_id)
+                .order_by(KnowledgePoint.sort_order)
             )).scalars().all()
             chunks = (await db.execute(
-                select(ContentChunk)
+                select(ContentChunk).where(
+                    ContentChunk.source_doc_id.in_(doc_ids)
+                    | ((ContentChunk.source_doc_id.is_(None)) & (ContentChunk.subject_id == subject_id))
+                )
             )).scalars().all()
 
             store_dir = Path(settings.DATA_DIR) / "vector_store" / str(subject_id)
@@ -866,6 +1125,9 @@ class RAGService:
                     elif kp.level == 1:
                         section = kp
                         chapter = kp_map.get(kp.parent_id)
+                    elif kp.level == 0:
+                        chapter = kp
+                        section = None
                 else:
                     # kp_id like "KP-1.2.3": derive section "KP-1.2", chapter "KP-1"
                     import re as _re

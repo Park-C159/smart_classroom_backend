@@ -1,6 +1,7 @@
 """Authentication API endpoints: login, register, refresh, logout."""
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +18,7 @@ from app.core.security import (
 )
 from app.core.redis_client import blacklist_token, is_token_blacklisted
 from app.models import User
-from app.schemas.schemas import LoginRequest, RefreshRequest, TokenResponse, UserCreate, UserOut
+from app.schemas.schemas import LoginRequest, RefreshRequest, TokenResponse, UserOut
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -42,31 +43,35 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
+class RegisterBody(BaseModel):
+    student_id: str = Field(..., min_length=1, max_length=50, description="学工号（登录账号）")
+    password: str = Field(..., min_length=6, max_length=128)
+    real_name: str = Field(..., min_length=1, max_length=50)
+    class_name: str | None = None
+
+
 @router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 async def register(
-    request: UserCreate,
+    request: RegisterBody,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
-    """Register a new user. Only admins can create admin accounts."""
-    if request.role == "admin" and current_user["role"] != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有管理员可以创建管理员账号")
+    """学生自助注册：用学工号 + 密码注册账号（仅学生，公开接口）。"""
+    username = request.student_id.strip()
 
-    existing = await db.execute(select(User).where(User.username == request.username))
+    existing = await db.execute(select(User).where(User.username == username))
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="该学工号已注册")
 
     user = User(
-        username=request.username,
+        username=username,
         password_hash=hash_password(request.password),
         real_name=request.real_name,
-        role=request.role,
+        role="student",
         class_name=request.class_name,
-        student_id=request.student_id,
-        email=request.email,
+        student_id=username,
     )
     db.add(user)
-    await db.flush()
+    await db.commit()
     await db.refresh(user)
     return UserOut.model_validate(user)
 

@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.core.security import get_current_user, get_admin_user, get_teacher_or_admin
 from app.models import (
-    KnowledgePoint, ContentChunk, Exercise, Document,
+    KnowledgePoint, ContentChunk, Document, TestQuestion,
 )
 from app.services.knowledge_tree_service import KnowledgeTreeService
 
@@ -18,6 +18,38 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/knowledge", tags=["知识树"])
 tree_service = KnowledgeTreeService()
+
+
+@router.get("/build-status")
+async def get_build_status(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """返回各学科知识库构建状态（是否已构建、分块数）。"""
+    import json as _json
+    from pathlib import Path as _Path
+    from app.config import settings as _settings
+    from app.models import Subject
+    subjects = (await db.execute(
+        select(Subject).where(Subject.is_active == True).order_by(Subject.id)
+    )).scalars().all()
+    result = []
+    for s in subjects:
+        store = _Path(_settings.DATA_DIR) / "vector_store" / str(s.id)
+        chunks = 0
+        meta = store / "chunk_meta.json"
+        if meta.exists():
+            try:
+                chunks = len(_json.loads(meta.read_text(encoding="utf-8")))
+            except Exception:
+                chunks = 0
+        result.append({
+            "subject_id": s.id,
+            "subject_name": s.name,
+            "kb_built": (store / "faiss_chunk.index").exists(),
+            "kb_chunks": chunks,
+        })
+    return result
 
 
 # ── Pydantic schemas ──
@@ -30,6 +62,7 @@ class KPCreate(BaseModel):
     chapter: str | None = None
     level: int = 2
     sort_order: int = 0
+    subject_id: int = Field(..., description="所属学科")
 
 
 class KPUpdate(BaseModel):
@@ -59,60 +92,21 @@ class ChunkUpdate(BaseModel):
 _EXERCISE_TITLES = {"习题", "补充题"}
 
 @router.get("/tree")
-async def get_knowledge_tree(db: AsyncSession = Depends(get_db)):
-    """Get knowledge tree — textbook KPs only, no reference doc, no exercise sections."""
+async def get_knowledge_tree(
+    subject_id: int = Query(..., description="Subject ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get knowledge tree for a subject (manually built by admin/teacher)."""
     result = await db.execute(
-        select(KnowledgePoint).order_by(KnowledgePoint.sort_order)
+        select(KnowledgePoint)
+        .where(KnowledgePoint.subject_id == subject_id)
+        .order_by(KnowledgePoint.sort_order, KnowledgePoint.id)
     )
     kps = result.scalars().all()
 
-    # 1) Exclude reference-document KPs (D2-* prefix = doc 2 = reference)
-    kps = [kp for kp in kps if not kp.id.startswith("D2-")]
-
-    # 2) Deduplicate: prefer original KP-N over D1-KP-N (same textbook rebuilt)
-    # Collect all IDs from duplicate chapter trees to skip
-    seen_chapters = set()
-    dup_chapter_ids = set()  # chapter IDs to skip (D1-KP-N duplicates)
-    for kp in kps:
-        if kp.level == 0:
-            ch_num = kp.id.rsplit("-", 1)[-1]
-            if ch_num in seen_chapters:
-                dup_chapter_ids.add(kp.id)
-            else:
-                seen_chapters.add(ch_num)
-    # Also skip all descendants of duplicate chapters
-    if dup_chapter_ids:
-        dup_descendants = set()
-        id_to_parent = {kp.id: kp.parent_id for kp in kps}
-        for kp in kps:
-            pid = kp.parent_id
-            while pid:
-                if pid in dup_chapter_ids:
-                    dup_descendants.add(kp.id)
-                    break
-                pid = id_to_parent.get(pid)
-        dup_chapter_ids |= dup_descendants
-    kps = [kp for kp in kps if kp.id not in dup_chapter_ids]
-
-    # 2) Exclude exercise/supplement sections (already in question bank)
-    def _is_exercise_section(title: str) -> bool:
-        t = title.strip()
-        return t in _EXERCISE_TITLES or "习题" in t or "补充题" in t
-    exercise_parents = {kp.id for kp in kps if kp.level == 1 and _is_exercise_section(kp.title)}
-    skip_ids = set(exercise_parents)
-    id_to_parent = {kp.id: kp.parent_id for kp in kps}
-    for kp in kps:
-        pid = kp.parent_id
-        while pid:
-            if pid in exercise_parents:
-                skip_ids.add(kp.id)
-                break
-            pid = id_to_parent.get(pid)
-    kps = [kp for kp in kps if kp.id not in skip_ids]
-
     # Build tree structure (recursive, supports arbitrary depth)
     kp_map = {kp.id: kp for kp in kps}
-    children_map = {}  # parent_id → list of children
+    children_map: dict[str, list[KnowledgePoint]] = {}
     for kp in kps:
         if kp.parent_id:
             children_map.setdefault(kp.parent_id, []).append(kp)
@@ -145,6 +139,7 @@ def _kp_to_node(kp: KnowledgePoint) -> dict:
         "chapter": kp.chapter,
         "level": kp.level,
         "sort_order": kp.sort_order,
+        "subject_id": kp.subject_id,
         "created_at": kp.created_at.isoformat() if kp.created_at else None,
     }
 
@@ -157,7 +152,7 @@ async def get_kp(kp_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(KnowledgePoint)
         .where(KnowledgePoint.id == kp_id)
-        .options(selectinload(KnowledgePoint.content_chunks), selectinload(KnowledgePoint.exercises))
+        .options(selectinload(KnowledgePoint.content_chunks))
     )
     kp = result.scalar_one_or_none()
     if not kp:
@@ -169,11 +164,6 @@ async def get_kp(kp_id: str, db: AsyncSession = Depends(get_db)):
             {"id": c.id, "chunk_type": c.chunk_type, "content": c.content,
              "page_number": c.page_number}
             for c in (kp.content_chunks or [])
-        ],
-        "exercises": [
-            {"id": e.id, "question_text": e.question_text, "answer_text": e.answer_text,
-             "question_type": e.question_type, "difficulty": e.difficulty, "source": e.source}
-            for e in (kp.exercises or [])
         ],
     }
 
@@ -195,6 +185,7 @@ async def create_kp(
         id=data.id, title=data.title, summary=data.summary,
         parent_id=data.parent_id, chapter=data.chapter,
         level=data.level, sort_order=data.sort_order,
+        subject_id=data.subject_id,
     )
     db.add(kp)
     await db.flush()
@@ -238,19 +229,53 @@ async def delete_kp(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_admin_user),
 ):
-    """Delete a knowledge point and its associated chunks/exercises."""
-    kp = await db.scalar(select(KnowledgePoint).where(KnowledgePoint.id == kp_id))
-    if not kp:
+    """删除知识点及其所有子节点（章→节）。
+
+    用原生 SQL 删除：ORM 的 db.delete() 会对 content_chunks/exercises 等关系
+    尝试把 kp_id 置空，而这些列是 NOT NULL，导致 IntegrityError。
+    """
+    from sqlalchemy import text as sa_text
+    node = await db.scalar(select(KnowledgePoint).where(KnowledgePoint.id == kp_id))
+    if not node:
         raise HTTPException(404, "知识点不存在")
+    subject_id = node.subject_id
+    is_chapter = node.level == 0
 
-    # Cascade delete children
-    children = (await db.execute(
-        select(KnowledgePoint).where(KnowledgePoint.parent_id == kp_id)
-    )).scalars().all()
-    for child in children:
-        await db.delete(child)
+    # 收集该节点及全部后代 id（层级浅，用 BFS）
+    ids = [kp_id]
+    frontier = [kp_id]
+    while frontier:
+        rows = (await db.execute(
+            select(KnowledgePoint.id).where(KnowledgePoint.parent_id.in_(frontier))
+        )).scalars().all()
+        frontier = [r for r in rows if r not in ids]
+        ids.extend(frontier)
 
-    await db.delete(kp)
+    placeholders = ",".join(f":id{i}" for i in range(len(ids)))
+    params = {f"id{i}": v for i, v in enumerate(ids)}
+    await db.execute(
+        sa_text(f"DELETE FROM knowledge_points WHERE id IN ({placeholders})"), params
+    )
+    await db.commit()
+
+    # 删除章后，其下分块成了孤儿，只对这些块按内容相似度重新匹配到剩余章，并重写索引元数据
+    if is_chapter and subject_id:
+        try:
+            from sqlalchemy import or_
+            from app.services.rag_service import RAGService
+            from app.models import ChunkKpMap
+            orphan_ids = list((await db.execute(
+                select(ChunkKpMap.chunk_id).where(
+                    or_(ChunkKpMap.chapter_id.in_(ids), ChunkKpMap.section_id.in_(ids))
+                )
+            )).scalars().all())
+            if orphan_ids:
+                rag = RAGService()
+                await rag.match_chunks_to_chapters(db, subject_id, chunk_ids=orphan_ids)
+                await rag._write_chunk_meta(db, subject_id)
+        except Exception as e:
+            logger.warning("删除章后重新匹配分块失败: %s", e)
+
     return {"message": f"知识点 {kp_id} 已删除"}
 
 
@@ -271,6 +296,77 @@ async def reorder_kps(
                 kp.parent_id = item["parent_id"]
     await db.flush()
     return {"message": f"已更新 {len(orders)} 个知识点的排序"}
+
+
+@router.post("/renumber")
+async def renumber_subject(
+    subject_id: int = Query(..., description="Subject ID"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """按当前 sort_order 重新给章/节编号：id 重写为 KP-{sid}-{n} / KP-{sid}-{n}.{m}，并级联更新引用。"""
+    from sqlalchemy import text as sa_text
+
+    nodes = (await db.execute(
+        select(KnowledgePoint).where(KnowledgePoint.subject_id == subject_id)
+    )).scalars().all()
+
+    # 章（level 0）按 sort_order 排；节挂在其父章下按 sort_order 排
+    chapters = sorted([n for n in nodes if n.level == 0], key=lambda n: (n.sort_order, n.id))
+    old_to_new: dict[str, str] = {}
+    for i, ch in enumerate(chapters, 1):
+        new_ch = f"KP-{subject_id}-{i}"
+        old_to_new[ch.id] = new_ch
+        secs = sorted([n for n in nodes if n.parent_id == ch.id], key=lambda n: (n.sort_order, n.id))
+        for j, sec in enumerate(secs, 1):
+            old_to_new[sec.id] = f"{new_ch}.{j}"
+
+    if not old_to_new:
+        return {"message": "该学科暂无节点", "count": 0}
+
+    # 两阶段改名（id 与 parent_id 都走临时值），避免主键冲突，也避免章交换时 parent_id 串行
+    old_to_tmp = {old: f"__tmp_{subject_id}_{k}" for k, old in enumerate(old_to_new)}
+    # 1) id: old → tmp
+    for old, tmp in old_to_tmp.items():
+        await db.execute(sa_text("UPDATE knowledge_points SET id=:n WHERE id=:o"), {"n": tmp, "o": old})
+    # 2) parent_id: old → tmp（先跟着临时值，防止新旧 id 交换时二次覆盖）
+    for old, tmp in old_to_tmp.items():
+        await db.execute(sa_text("UPDATE knowledge_points SET parent_id=:n WHERE parent_id=:o"), {"n": tmp, "o": old})
+    # 3) id: tmp → new
+    for old, new in old_to_new.items():
+        await db.execute(sa_text("UPDATE knowledge_points SET id=:n WHERE id=:o"), {"n": new, "o": old_to_tmp[old]})
+    # 4) parent_id: tmp → new
+    for old, new in old_to_new.items():
+        await db.execute(sa_text("UPDATE knowledge_points SET parent_id=:n WHERE parent_id=:o"), {"n": new, "o": old_to_tmp[old]})
+
+    # 级联更新引用该树节点的其它表（单列字符串/外键）
+    for table, col in (
+        ("content_chunks", "kp_id"),
+        ("kp_mastery", "kp_id"),
+        ("discussions", "kp_id"),
+        ("test_questions", "kp_id"),
+        ("paper_questions", "kp_id"),
+        ("chunk_kp_map", "chapter_id"),
+        ("chunk_kp_map", "section_id"),
+    ):
+        for old, new in old_to_new.items():
+            await db.execute(
+                sa_text(f"UPDATE {table} SET {col}=:n WHERE {col}=:o"), {"n": new, "o": old}
+            )
+
+    await db.commit()
+    return {"message": f"已重新编号 {len(old_to_new)} 个节点", "count": len(old_to_new), "mapping": old_to_new}
+
+
+@router.post("/match-chunks")
+async def match_chunks_endpoint(
+    subject_id: int = Query(..., description="Subject ID"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """手动触发：把该学科知识库分块按内容相似度重新匹配到知识树的章并重建索引。"""
+    from app.services.rag_service import RAGService
+    return await RAGService().build_chunk_index(subject_id, db=db)
 
 
 # ── Content chunks ──
@@ -298,15 +394,18 @@ async def create_chunk(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_teacher_or_admin),
 ):
-    """Add a content chunk to a knowledge point."""
+    """Add a content chunk to a knowledge point (subject inherited from KP)."""
+    kp = await db.scalar(select(KnowledgePoint).where(KnowledgePoint.id == data.kp_id))
     chunk = ContentChunk(
         kp_id=data.kp_id, chunk_type=data.chunk_type,
         content=data.content, page_number=data.page_number,
+        subject_id=kp.subject_id if kp else None,
     )
     db.add(chunk)
     await db.flush()
     return {"id": chunk.id, "kp_id": chunk.kp_id, "chunk_type": chunk.chunk_type,
-            "content": chunk.content, "page_number": chunk.page_number}
+            "content": chunk.content, "page_number": chunk.page_number,
+            "subject_id": chunk.subject_id}
 
 
 @router.put("/chunks/{chunk_id}")
@@ -352,42 +451,84 @@ class ChunkUpdate(BaseModel):
     chunk_type: str | None = None
     page_number: int | None = None
 
+
+class ChunkChapterUpdate(BaseModel):
+    chapter_id: str | None = None
+    section_id: str | None = None
+
+
 @router.get("/chunks")
 async def list_chunks(
     subject_id: int | None = Query(None, description="Subject ID"),
-    section_id: str | None = Query(None, description="Section KP ID, e.g. KP-1.1"),
+    chapter_id: str | None = Query(None, description="章 ID"),
+    section_id: str | None = Query(None, description="节 ID"),
     chunk_type: str | None = Query(None, description="Filter by type"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(50, le=2000, description="Page size"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_teacher_or_admin),
 ):
-    """List content chunks with filters for management view."""
-    from sqlalchemy import func as sa_func
+    """List content chunks with chapter/section mapping for management view."""
+    from app.models import ChunkKpMap
 
-    # Build section filter: match kp_id prefix (e.g., "KP-1.1" matches "KP-1.1.1", "KP-1.1.2", ...)
-    if section_id:
-        prefix = section_id + "."
-        chunks = await db.execute(
-            select(ContentChunk).where(
-                ContentChunk.kp_id.like(prefix + "%"),
-                ContentChunk.subject_id == subject_id if subject_id else True,
-                ContentChunk.chunk_type == chunk_type if chunk_type else True,
-            ).order_by(ContentChunk.id).limit(page_size).offset((page - 1) * page_size)
-        )
-    else:
-        chunks = await db.execute(
-            select(ContentChunk).where(
-                ContentChunk.subject_id == subject_id if subject_id else True,
-                ContentChunk.chunk_type == chunk_type if chunk_type else True,
-            ).order_by(ContentChunk.id).limit(page_size).offset((page - 1) * page_size)
-        )
-    return [{
-        "id": c.id, "kp_id": c.kp_id, "chunk_type": c.chunk_type,
-        "content": c.content[:300] + ("..." if len(c.content or "") > 300 else ""),
-        "full_content": c.content, "page_number": c.page_number,
-        "source_doc_id": c.source_doc_id, "images": c.images,
-    } for c in chunks.scalars().all()]
+    conds = []
+    if subject_id:
+        conds.append(ContentChunk.subject_id == subject_id)
+    if chunk_type:
+        conds.append(ContentChunk.chunk_type == chunk_type)
+
+    # 章节过滤走 chunk_kp_map
+    if chapter_id or section_id:
+        mconds = []
+        if chapter_id:
+            mconds.append(ChunkKpMap.chapter_id == chapter_id)
+        if section_id:
+            mconds.append(ChunkKpMap.section_id == section_id)
+        rows = await db.execute(select(ChunkKpMap.chunk_id).where(and_(*mconds)))
+        cids = [r[0] for r in rows.all()]
+        if not cids:
+            return []
+        conds.append(ContentChunk.id.in_(cids))
+
+    chunks = (await db.execute(
+        select(ContentChunk).where(and_(*conds)).order_by(ContentChunk.id)
+        .offset((page - 1) * page_size).limit(page_size)
+    )).scalars().all()
+
+    chunk_ids = [c.id for c in chunks]
+    map_rows = []
+    if chunk_ids:
+        map_rows = (await db.execute(
+            select(ChunkKpMap).where(ChunkKpMap.chunk_id.in_(chunk_ids))
+        )).scalars().all()
+    m_by = {m.chunk_id: m for m in map_rows}
+
+    kp_ids = set()
+    for m in map_rows:
+        if m.chapter_id:
+            kp_ids.add(m.chapter_id)
+        if m.section_id:
+            kp_ids.add(m.section_id)
+    kp_map = {}
+    if kp_ids:
+        kps = (await db.execute(select(KnowledgePoint).where(KnowledgePoint.id.in_(kp_ids)))).scalars().all()
+        kp_map = {k.id: k for k in kps}
+
+    out = []
+    for c in chunks:
+        m = m_by.get(c.id)
+        chapter_id = m.chapter_id if m else None
+        section_id = m.section_id if m else None
+        out.append({
+            "id": c.id, "kp_id": c.kp_id, "chunk_type": c.chunk_type,
+            "chapter_id": chapter_id, "section_id": section_id,
+            "chapter_title": kp_map[chapter_id].title if chapter_id in kp_map else "",
+            "section_title": kp_map[section_id].title if section_id in kp_map else "",
+            "content": c.content[:300] + ("..." if len(c.content or "") > 300 else ""),
+            "full_content": c.content, "page_number": c.page_number,
+            "source_doc_id": c.source_doc_id, "images": c.images,
+        })
+    return out
 
 
 @router.put("/chunks/{chunk_id}")
@@ -413,136 +554,84 @@ async def update_chunk(
     return {"message": "分块已更新", "id": chunk_id}
 
 
+@router.put("/chunks/{chunk_id}/chapter")
+async def update_chunk_chapter(
+    chunk_id: int,
+    data: ChunkChapterUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """手动修改分块归属的章/节（覆盖自动匹配）。"""
+    from app.models import ChunkKpMap
+
+    chunk = await db.scalar(select(ContentChunk).where(ContentChunk.id == chunk_id))
+    if not chunk:
+        raise HTTPException(404, "内容块不存在")
+
+    chapter_id = data.chapter_id
+    section_id = data.section_id
+    if section_id and not chapter_id:
+        sec = await db.scalar(select(KnowledgePoint).where(KnowledgePoint.id == section_id))
+        if sec:
+            chapter_id = sec.parent_id
+
+    row = await db.get(ChunkKpMap, chunk_id)
+    if row:
+        row.chapter_id = chapter_id
+        row.section_id = section_id
+    else:
+        db.add(ChunkKpMap(
+            chunk_id=chunk_id, subject_id=chunk.subject_id,
+            chapter_id=chapter_id, section_id=section_id, similarity=1.0,
+        ))
+    chunk.kp_id = chapter_id or "flat"
+    await db.commit()
+
+    # 重写该学科的 chunk_meta.json（不含向量，快）
+    if chunk.subject_id:
+        try:
+            from app.services.rag_service import RAGService
+            await RAGService.__new__(RAGService)._write_chunk_meta(db, chunk.subject_id)
+        except Exception as e:
+            logger.warning("更新分块章节后重写索引元数据失败: %s", e)
+
+    return {"message": "已更新分块章节", "chunk_id": chunk_id, "chapter_id": chapter_id, "section_id": section_id}
+
+
 @router.post("/chunks/rebuild-index")
 async def rebuild_kb_index(
     subject_id: int = Query(..., description="Subject ID"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_teacher_or_admin),
 ):
-    """Rebuild knowledge base FAISS index for a subject."""
+    """Rebuild knowledge base FAISS index for a subject (问答检索用的层级 chunk 索引)."""
     from app.services.rag_service import RAGService
     from app.services.gpu_manager import gpu_manager
 
-    gpu_manager.clear_gpu()
+    gpu_manager.to_gpu("embedding")  # 构建索引需要 embedding 在 GPU；clear_gpu 会把它挪到 CPU 导致跑满 CPU
     try:
         rag = RAGService()
-        result = await rag.build_kb_index(subject_id, db=db)
+        result = await rag.build_chunk_index(subject_id, db=db)
         return {"message": "知识库索引已重建", "result": result}
     finally:
         gpu_manager.restore_defaults()
 
 
-# ── Question Bank management ──
-
-@router.get("/question-bank")
-async def list_question_bank(
-    subject_id: int | None = Query(None),
-    chapter: str | None = Query(None),
-    source: str | None = Query(None),
-    source_doc_id: int | None = Query(None, description="Filter by source document ID"),
-    question_type: str | None = Query(None, description="Filter by question type"),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, le=2000),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_teacher_or_admin),
-):
-    """List question bank entries."""
-    from app.models import QuestionBank
-    conditions = []
-    if subject_id:
-        conditions.append(QuestionBank.subject_id == subject_id)
-    if chapter:
-        conditions.append(QuestionBank.chapter == chapter)
-    if source:
-        conditions.append(QuestionBank.source == source)
-    if source_doc_id:
-        conditions.append(QuestionBank.source_doc_id == source_doc_id)
-    if question_type:
-        conditions.append(QuestionBank.question_type == question_type)
-
-    q = select(QuestionBank).where(*conditions).order_by(QuestionBank.id).limit(page_size).offset((page - 1) * page_size)
-    result = await db.execute(q)
-    questions = result.scalars().all()
-    return [{
-        "id": q.id, "question_text": q.question_text,
-        "answer_text": q.answer_text, "question_type": q.question_type,
-        "difficulty": q.difficulty, "source": q.source,
-        "source_doc_id": q.source_doc_id, "page_number": q.page_number,
-        "chapter": q.chapter, "kp_id": q.kp_id,
-        "images": q.images, "verified": q.verified,
-        "merged_from": q.merged_from,
-    } for q in questions]
-
-
-@router.put("/question-bank/{question_id}")
-async def update_question_bank(
-    question_id: int,
-    data: dict,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_teacher_or_admin),
-):
-    """Edit a question bank entry."""
-    from app.models import QuestionBank
-    q = await db.get(QuestionBank, question_id)
-    if not q:
-        raise HTTPException(404, "题目不存在")
-    for field in ("question_text", "answer_text", "question_type", "chapter",
-                  "page_number", "source_doc_id", "difficulty", "verified"):
-        if field in data:
-            setattr(q, field, data[field])
-    # Update embedding text when question_text changes
-    if "question_text" in data:
-        q.embedding_text = data["question_text"]
-    await db.commit()
-    return {"message": "已更新", "id": question_id}
-
-
-@router.post("/question-bank")
-async def create_question_bank(
-    data: dict,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_teacher_or_admin),
-):
-    """Add a new question to the question bank (teacher/admin)."""
-    from app.models import QuestionBank
-    question_text = (data.get("question_text") or "").strip()
-    if not question_text:
-        raise HTTPException(400, "题目内容不能为空")
-    q = QuestionBank(
-        question_text=question_text,
-        answer_text=data.get("answer_text") or "",
-        question_type=data.get("question_type") or "reference",
-        difficulty=data.get("difficulty", 3),
-        source=data.get("source") or "manual",
-        source_doc_id=data.get("source_doc_id"),
-        page_number=data.get("page_number"),
-        chapter=data.get("chapter"),
-        kp_id=data.get("kp_id"),
-        subject_id=data.get("subject_id", 9),
-        embedding_text=question_text,
-        verified=data.get("verified", False),
-    )
-    db.add(q)
-    await db.commit()
-    await db.refresh(q)
-    return {"id": q.id, "message": "题目已添加，重建索引后即可用于检索"}
-
-
-@router.post("/question-bank/rebuild-index")
-async def rebuild_qb_index(
+@router.post("/rebuild-index")
+async def rebuild_search_index(
     subject_id: int = Query(..., description="Subject ID"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_teacher_or_admin),
 ):
-    """Rebuild question bank FAISS index for a subject."""
+    """重建指定学科用于问答检索的知识库分块索引。"""
     from app.services.rag_service import RAGService
     from app.services.gpu_manager import gpu_manager
 
-    gpu_manager.clear_gpu()
+    gpu_manager.to_gpu("embedding")  # 构建索引需要 embedding 在 GPU；clear_gpu 会把它挪到 CPU 导致跑满 CPU
     try:
         rag = RAGService()
-        result = await rag.build_qb_index(subject_id, db=db)
-        return {"message": "题库索引已重建", "result": result}
+        kb = await rag.build_chunk_index(subject_id, db=db)
+        return {"message": "学科知识库索引已重建", "kb": kb}
     finally:
         gpu_manager.restore_defaults()
 
@@ -555,7 +644,7 @@ async def build_tree_from_document(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_admin_user),
 ):
-    """Build knowledge tree from a parsed document using content_list_v2.json."""
+    """从解析文档构建知识库内容块（知识树已改为手动构建，不再由文档自动生成）。"""
     # Find the subject this document is assigned to
     from sqlalchemy import text as sa_text
     subj_result = await db.execute(
@@ -566,16 +655,10 @@ async def build_tree_from_document(
     subject_id = subj_row[0] if subj_row else None
 
     if not subject_id:
-        raise HTTPException(400, "请先将文档分配到学科后再构建知识树")
+        raise HTTPException(400, "请先将文档分配到学科后再构建知识库")
 
-    # Check if this is the primary document for the subject
-    existing_kps = await db.scalar(
-        select(func.count()).select_from(KnowledgePoint).where(KnowledgePoint.id.like("KP-%"))
-    )
-    is_primary = existing_kps == 0
-
-    # Build from content_list_v2.json
-    result = await tree_service.build_from_content_list(doc_id, subject_id, db, is_primary=is_primary)
+    # Build content chunks (knowledge base) from content_list_v2.json
+    result = await tree_service.build_from_content_list(doc_id, subject_id, db, is_primary=True)
 
     # Preview structure
     content_list_path = tree_service._find_content_list(doc_id)
@@ -615,11 +698,7 @@ async def preview_tree_structure(
     if not parsed:
         raise HTTPException(404, "文档尚未解析完成")
 
-    markdown = parsed.get("markdown", "")
-    if not markdown:
-        raise HTTPException(400, "解析结果中没有 Markdown 内容")
-
-    structure = tree_service.preview_structure(markdown)
+    structure = tree_service.preview_structure(doc_id)
     return structure
 
 
@@ -630,7 +709,7 @@ async def get_tree_stats(db: AsyncSession = Depends(get_db)):
     """Get knowledge tree statistics."""
     total_kps = await db.scalar(select(func.count(KnowledgePoint.id)))
     total_chunks = await db.scalar(select(func.count(ContentChunk.id)))
-    total_ex = await db.scalar(select(func.count(Exercise.id)))
+    total_ex = await db.scalar(select(func.count(TestQuestion.id)))
     chapters = (await db.execute(
         select(func.distinct(KnowledgePoint.chapter))
         .where(KnowledgePoint.chapter.isnot(None))
@@ -648,6 +727,7 @@ async def get_tree_stats(db: AsyncSession = Depends(get_db)):
 
 @router.get("/review")
 async def review_knowledge_tree(
+    subject_id: int = Query(..., description="Subject ID"),
     chapter: str | None = None,
     has_summary: bool | None = None,
     db: AsyncSession = Depends(get_db),
@@ -655,7 +735,9 @@ async def review_knowledge_tree(
 ):
     """Get all KPs with summary, chunk count, and exercise count for review."""
     result = await db.execute(
-        select(KnowledgePoint).order_by(KnowledgePoint.sort_order)
+        select(KnowledgePoint)
+        .where(KnowledgePoint.subject_id == subject_id)
+        .order_by(KnowledgePoint.sort_order)
     )
     kps = result.scalars().all()
 
@@ -674,9 +756,9 @@ async def review_knowledge_tree(
     ex_counts = {}
     if kps:
         eresult = await db.execute(
-            select(Exercise.kp_id, sa_func.count(Exercise.id))
-            .where(Exercise.kp_id.in_(kp_ids))
-            .group_by(Exercise.kp_id)
+            select(TestQuestion.kp_id, sa_func.count(TestQuestion.id))
+            .where(TestQuestion.kp_id.in_(kp_ids))
+            .group_by(TestQuestion.kp_id)
         )
         ex_counts = {row[0]: row[1] for row in eresult.all()}
 
@@ -713,7 +795,7 @@ async def review_knowledge_tree(
         # Get exercises for the parent section
         sec_id = '.'.join(kp.id.split('.')[:2])
         sec_exs = await db.execute(
-            select(Exercise).where(Exercise.kp_id.like(f"{sec_id}.%"))
+            select(TestQuestion).where(TestQuestion.kp_id.like(f"{sec_id}.%"))
         )
         exercises = sec_exs.scalars().all()
         ex_list = [

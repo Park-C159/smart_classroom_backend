@@ -1,7 +1,7 @@
 """私信 API — 用户间一对一消息（学生 ↔ 教师）。"""
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, and_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -34,8 +34,32 @@ async def _subject_ids(db: AsyncSession, user_id: int) -> set[int]:
     return {r[0] for r in res.all()}
 
 
+def _visible(me: int):
+    """消息对 me 可见的条件：未被 me 单方删除（sender 看 deleted_by_sender，recipient 看 deleted_by_recipient）。"""
+    return or_(
+        and_(Message.sender_id == me, Message.deleted_by_sender.is_(False)),
+        and_(Message.recipient_id == me, Message.deleted_by_recipient.is_(False)),
+    )
+
+
+async def _has_conversation(db: AsyncSession, a: int, b: int) -> bool:
+    """两人之间是否已有过消息（任一方向），有则可直接回复，避免单向私信。"""
+    n = await db.scalar(
+        select(func.count(Message.id)).where(
+            or_(
+                (Message.sender_id == a) & (Message.recipient_id == b),
+                (Message.sender_id == b) & (Message.recipient_id == a),
+            )
+        )
+    )
+    return bool(n)
+
+
 async def _can_message(db: AsyncSession, me: User, other: User) -> bool:
-    """角色权限：管理员=全体；教师=本班学生；学生=对应学科教师。"""
+    """角色权限：管理员=全体；教师=本班学生；学生=对应学科教师。已有会话者可互相回复。"""
+    # 收到过对方消息即可回复（否则管理员/教师先发，学生无法回，形成单向）
+    if await _has_conversation(db, me.id, other.id):
+        return True
     if me.role == "admin":
         return True
     if me.role == "teacher":
@@ -48,8 +72,8 @@ async def _can_message(db: AsyncSession, me: User, other: User) -> bool:
         if other.role != "teacher":
             return False
         my_sids = await _subject_ids(db, me.id)
-        if not my_sids:  # 未分配学科学生可联系所有教师
-            return True
+        if not my_sids:  # 未分配学科的学生不能私聊
+            return False
         other_sids = await _subject_ids(db, other.id)
         return bool(my_sids & other_sids)
     return False
@@ -100,17 +124,15 @@ async def list_contacts(
             stmt = stmt.where(User.class_name == me.class_name)
         users = (await db.execute(stmt.order_by(User.class_name, User.id))).scalars().all()
     else:  # student
-        teachers = (await db.execute(
-            select(User).where(User.role == "teacher", User.id != me.id).order_by(User.id)
-        )).scalars().all()
         my_sids = await _subject_ids(db, me.id)
-        if my_sids:
-            filtered = []
-            for t in teachers:
-                if my_sids & await _subject_ids(db, t.id):
-                    filtered.append(t)
-            teachers = filtered
-        users = teachers
+        if not my_sids:
+            users = []  # 未分配学科的学生没有可私聊的联系人
+        else:
+            teachers = (await db.execute(
+                select(User).where(User.role == "teacher", User.id != me.id).order_by(User.id)
+            )).scalars().all()
+            filtered = [t for t in teachers if my_sids & await _subject_ids(db, t.id)]
+            users = filtered
 
     return await _contacts_payload(users, db)
 
@@ -124,7 +146,7 @@ async def list_conversations(
     me = current_user["user_id"]
     result = await db.execute(
         select(Message)
-        .where(or_(Message.sender_id == me, Message.recipient_id == me))
+        .where(_visible(me))
         .order_by(Message.created_at.desc())
         .limit(2000)
     )
@@ -175,7 +197,7 @@ async def list_with_user(
         (Message.sender_id == me) & (Message.recipient_id == user_id),
         (Message.sender_id == user_id) & (Message.recipient_id == me),
     )
-    base = select(Message).where(cond)
+    base = select(Message).where(cond, _visible(me))
     total = await db.scalar(select(func.count()).select_from(base.subquery()))
 
     result = await db.execute(
@@ -246,6 +268,52 @@ async def send_message(
     }
 
 
+@router.delete("/conversation/{user_id}")
+async def delete_conversation(
+    user_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """单向删除与某用户的全部私信记录：只从我的视角清除，对方记录保留。"""
+    me = current_user["user_id"]
+    if user_id == me:
+        raise HTTPException(400, "无效的会话")
+    # 我发的 → deleted_by_sender；我收的 → deleted_by_recipient
+    await db.execute(
+        update(Message)
+        .where(Message.sender_id == me, Message.recipient_id == user_id)
+        .values(deleted_by_sender=True)
+    )
+    await db.execute(
+        update(Message)
+        .where(Message.sender_id == user_id, Message.recipient_id == me)
+        .values(deleted_by_recipient=True)
+    )
+    await db.commit()
+    return {"message": "会话已删除"}
+
+
+@router.delete("/{message_id}")
+async def delete_message(
+    message_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """单向删除单条私信：只从我的视角清除，对方记录保留。"""
+    me = current_user["user_id"]
+    msg = await db.get(Message, message_id)
+    if not msg:
+        raise HTTPException(404, "消息不存在")
+    if msg.sender_id != me and msg.recipient_id != me:
+        raise HTTPException(403, "无权删除该消息")
+    if msg.sender_id == me:
+        msg.deleted_by_sender = True
+    if msg.recipient_id == me:
+        msg.deleted_by_recipient = True
+    await db.commit()
+    return {"message": "消息已删除"}
+
+
 @router.get("/unread-count")
 async def unread_count(
     current_user: dict = Depends(get_current_user),
@@ -254,6 +322,10 @@ async def unread_count(
     """未读私信总数（用于红点）。"""
     me = current_user["user_id"]
     n = await db.scalar(
-        select(func.count(Message.id)).where(Message.recipient_id == me, Message.is_read.is_(False))
+        select(func.count(Message.id)).where(
+            Message.recipient_id == me,
+            Message.is_read.is_(False),
+            Message.deleted_by_recipient.is_(False),
+        )
     )
     return {"count": n or 0}

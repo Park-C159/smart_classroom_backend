@@ -29,6 +29,9 @@ logs/
 # ============ 临时 / 基准脚本 ============
 *.bak
 scripts/benchmark_*.py
+_mtest.py
+_test_delete.py
+_revalidate_all.py
 
 # ============ IDE / 系统 ============
 .idea/

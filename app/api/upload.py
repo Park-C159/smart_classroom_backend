@@ -156,7 +156,7 @@ async def import_users_excel(
                     break
             id_col = None
             for h in row.keys():
-                if h and ("学号" in str(h) or "student_id" in str(h) or "id" in str(h).lower()):
+                if h and ("学号" in str(h) or "学工号" in str(h) or "student_id" in str(h) or "id" in str(h).lower()):
                     id_col = h
                     break
 

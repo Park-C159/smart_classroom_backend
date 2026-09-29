@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -155,6 +156,7 @@ async def chat_stream(
     history: Optional[str] = Form(None),
     deep_think: bool = Form(False),
     smart_search: bool = Form(False),
+    subject_id: Optional[int] = Form(None),
     files: List[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -222,7 +224,8 @@ async def chat_stream(
         # History agent: check if history is needed and rewrite question
         history_context = ""
         if chat_history:
-            resolved = llm.resolve_history(final_question, chat_history)
+            # 跑在线程里，避免同步 LLM 调用（含限流重试的 sleep）阻塞事件循环
+            resolved = await asyncio.to_thread(llm.resolve_history, final_question, chat_history)
             if resolved["needed"]:
                 history_context = resolved["context"]
                 if resolved["rewritten_question"] != final_question:
@@ -253,15 +256,48 @@ async def chat_stream(
             for r in web_results
         ]
 
-        # Auto-select: if no docs specified but only one subject exists, use all its docs
+        # 解析学科：显式传入 > 用户已分配学科（取第一个）> 从所选教材推导
+        user_id = current_user.get("user_id") or current_user.get("id")
+        resolved_subject_id = subject_id
+        if not resolved_subject_id:
+            from app.models import UserSubject
+            sids = (await db.execute(
+                select(UserSubject.subject_id).where(UserSubject.user_id == user_id)
+            )).scalars().all()
+            if sids:
+                resolved_subject_id = sids[0]
+                logger.info("使用用户已分配学科: %d", resolved_subject_id)
+
+        # 学生未分配学科时禁止使用答疑（学科由管理员/教师在用户管理中分配）
+        if not resolved_subject_id and current_user.get("role") == "student":
+            def err_gen():
+                yield json.dumps({"type": "error", "content": "您尚未分配学科，暂无法使用答疑，请联系管理员分配学科"}, ensure_ascii=False) + "\n\n"
+            return StreamingResponse(err_gen(), media_type="text/event-stream")
+
+        # 自动选教材：优先该学科下的全部教材
         if not doc_ids_to_search:
-            from app.models import DocumentSubject
-            # Find all docs with any assigned subject
-            all_docs = await db.execute(select(DocumentSubject.document_id))
-            all_ids = [r[0] for r in all_docs.all()]
+            cond = select(DocumentSubject.document_id)
+            if resolved_subject_id:
+                cond = cond.where(DocumentSubject.subject_id == resolved_subject_id)
+            all_ids = [r[0] for r in (await db.execute(cond)).all()]
             if all_ids:
                 doc_ids_to_search = all_ids
-                logger.info("Auto-selected documents: %s", all_ids)
+                logger.info("Auto-selected documents (subject=%s): %s", resolved_subject_id, all_ids)
+
+        # 若仍无学科，从所选教材推导
+        if not resolved_subject_id and doc_ids_to_search:
+            subj_rows = await db.execute(
+                select(DocumentSubject.subject_id)
+                .where(DocumentSubject.document_id.in_(doc_ids_to_search))
+                .distinct()
+            )
+            distinct_sids = [r[0] for r in subj_rows.all() if r[0] is not None]
+            if len(distinct_sids) == 1:
+                resolved_subject_id = distinct_sids[0]
+            elif len(distinct_sids) > 1:
+                def err_gen():
+                    yield json.dumps({"type": "error", "content": "所选教材跨越多个学科，请只选择同一学科的教材"}, ensure_ascii=False) + "\n\n"
+                return StreamingResponse(err_gen(), media_type="text/event-stream")
 
         if not doc_ids_to_search:
             def err_gen():
@@ -272,35 +308,32 @@ async def chat_stream(
         docs = result.scalars().all()
         doc_title_map = {d.id: d.filename for d in docs}
 
+        # 学科专属 system prompt（按学科定制 + 强调优先参考 RAG 召回内容）
+        subject_name = None
+        if resolved_subject_id:
+            from app.models import Subject
+            subject_name = await db.scalar(
+                select(Subject.name).where(Subject.id == resolved_subject_id)
+            )
+        system_prompt = LLMService.build_subject_prompt(subject_name)
+
         all_candidates = []
         final_top_k = top_k
-        if hierarchical:
-            candidates = rag.retrieve_hierarchical(
-                final_question, subject_id=9,
-                top_k=3,  # KB: 3 chunks
+        if hierarchical and resolved_subject_id:
+            if not rag.has_chunk_index(resolved_subject_id):
+                def err_gen():
+                    yield json.dumps({"type": "error", "content": "该学科尚未构建知识库，暂不支持答疑"}, ensure_ascii=False) + "\n\n"
+                return StreamingResponse(err_gen(), media_type="text/event-stream")
+            candidates = rag.retrieve_chunks(
+                final_question, subject_id=resolved_subject_id,
+                top_k=top_k,  # 只检索知识库（扁平分块）
             )
             for c in candidates:
                 c["doc_id"] = c.get("source_doc_id", 1)
                 c["doc_title"] = doc_title_map.get(c["doc_id"], f"文档{c['doc_id']}")
             all_candidates = candidates
 
-            # QB search — 5 results, merged with KB
-            import sys as _sys
-            qb_results = rag.search_qb(final_question, subject_id=9, top_k=3)
-            _sys.stderr.write(f"DEBUG QB search: {len(qb_results)} results\n")
-            _sys.stderr.flush()
-            for qb in qb_results:
-                qb["doc_id"] = qb.get("source_doc_id", 2)
-                qb["doc_title"] = doc_title_map.get(qb["doc_id"], f"文档{qb['doc_id']}")
-                qb["chapter_title"] = qb.get("chapter", "")
-                qb["source"] = "qb"
-                qb["chunk_type"] = "exercise"
-                qb["text"] = qb.get("question_text", qb.get("text", ""))[:512]
-                qb["page_number"] = qb.get("page_num")
-                all_candidates.append(qb)
-            logger.info("QB search added %d results", len(qb_results))
-
-            final_top_k = 6
+            final_top_k = top_k
 
         if not all_candidates:
             # Fallback to two-stage or single-index retrieval
@@ -324,74 +357,64 @@ async def chat_stream(
         if not all_candidates:
             def no_ctx_gen():
                 ctx = [web_context_item] if web_context_item else []
-                for kind, text in llm.get_stream_response(query=final_question, context=ctx, history=chat_history, deep_think=deep_think):
+                for kind, text in llm.get_stream_response(query=final_question, context=ctx, system_prompt=system_prompt, history=chat_history, deep_think=deep_think):
                     if text:
                         yield json.dumps({"type": kind, "content": text}, ensure_ascii=False) + "\n\n"
                 yield json.dumps({"type": "sources", "sources": [], "web_sources": web_sources}, ensure_ascii=False) + "\n\n"
                 yield json.dumps({"type": "done"}, ensure_ascii=False) + "\n\n"
             return StreamingResponse(no_ctx_gen(), media_type="text/event-stream")
 
-        # Split KB and QB, each already reranked internally
-        kb_candidates = [c for c in all_candidates if c.get("source") != "qb"]
-        qb_candidates = [c for c in all_candidates if c.get("source") == "qb"]
-
-        # Dedup KB
+        # Dedup KB（分块检索结果去重）
         kb_unique = {}
-        for c in kb_candidates:
-            key = (c.get("doc_id"), c.get("kp_id", ""), c.get("chunk_type", ""))
+        for c in all_candidates:
+            key = c.get("chunk_id")
             score = c.get("rerank_score", c.get("score", 0))
             if key not in kb_unique or score > kb_unique[key].get("rerank_score", 0):
                 kb_unique[key] = c
-        kb_list = sorted(kb_unique.values(), key=lambda x: x.get("rerank_score", 0), reverse=True)[:3]
+        retrieved = sorted(kb_unique.values(), key=lambda x: x.get("rerank_score", 0), reverse=True)[:top_k]
 
-        # Dedup QB
-        qb_unique = {}
-        for c in qb_candidates:
-            key = (c.get("doc_id"), c.get("id", ""), c.get("chunk_type", ""))
-            score = c.get("rerank_score", c.get("score", 0))
-            if key not in qb_unique or score > qb_unique[key].get("rerank_score", 0):
-                qb_unique[key] = c
-        qb_list = sorted(qb_unique.values(), key=lambda x: x.get("rerank_score", 0), reverse=True)[:3]
-
-        retrieved = kb_list + qb_list
+        # 提取与问题相关的知识点（相关性 = 重排分数），用于学情判断；章 + 节两级
+        kp_relevance = {}
+        sec_relevance = {}
+        for c in retrieved:
+            score = c.get("rerank_score", c.get("score", 0)) or 0
+            kp_id = c.get("kp_id")
+            if kp_id and kp_id != "flat":
+                kp_relevance[kp_id] = max(kp_relevance.get(kp_id, 0), float(score))
+            section_id = c.get("section_id")
+            if section_id:
+                sec_relevance[section_id] = max(sec_relevance.get(section_id, 0), float(score))
+        matched_kps = ({
+            "kps": [{"kp_id": k, "relevance": round(v, 3)}
+                    for k, v in sorted(kp_relevance.items(), key=lambda x: x[1], reverse=True)][:8],
+            "sections": [{"kp_id": s, "relevance": round(v, 3)}
+                         for s, v in sorted(sec_relevance.items(), key=lambda x: x[1], reverse=True)][:8],
+            "count": len(kp_relevance),
+        } if (kp_relevance or sec_relevance) else None)
 
         # Fetch FULL original chunk content from DB for sources
-        # Separate KB (ContentChunk) and QB (QuestionBank) — their IDs overlap!
         kb_ids = list(set(
             [c.get("chunk_id") for c in retrieved if c.get("chunk_id")]
         ))
-        qb_ids = list(set(
-            [c.get("id") for c in retrieved if c.get("source") == "qb" and c.get("id")]
-        ))
         kb_content_map = {}
-        qb_content_map = {}
         if kb_ids:
             from app.models import ContentChunk as CC
             db_chunks = await db.execute(select(CC).where(CC.id.in_(kb_ids)))
             for dc in db_chunks.scalars().all():
                 kb_content_map[dc.id] = dc.content
-        if qb_ids:
-            from app.models import QuestionBank as QB
-            qb_entries = await db.execute(select(QB).where(QB.id.in_(qb_ids)))
-            for qb in qb_entries.scalars().all():
-                qb_content_map[qb.id] = qb.question_text or ""
 
         sources = []
         for i, chunk in enumerate(retrieved):
-            if chunk.get("source") == "qb":
-                full_text = qb_content_map.get(chunk.get("id")) or chunk.get("text", "")
-            else:
-                # DB content first (source of truth), fallback to FAISS metadata
-                full_text = (kb_content_map.get(chunk.get("chunk_id"))
-                             or chunk.get("full_text")
-                             or chunk.get("text", ""))
+            # DB content first (source of truth), fallback to FAISS metadata
+            full_text = (kb_content_map.get(chunk.get("chunk_id"))
+                         or chunk.get("full_text")
+                         or chunk.get("text", ""))
             excerpt = _safe_truncate(full_text, 200)
             src = {
                 "id": i + 1,
                 "excerpt": excerpt,
                 "content_full": full_text,
-                "kb_id": chunk.get("chunk_id"),  # for KB chunks, None for QB
-                "qb_id": chunk.get("id") if chunk.get("source") == "qb" else None,
+                "kb_id": chunk.get("chunk_id"),
                 "chunk_type": chunk.get("chunk_type", ""),
                 "source": chunk.get("source", "page"),
                 "doc_title": chunk.get("doc_title", ""),
@@ -412,11 +435,20 @@ async def chat_stream(
                 src["answer_text"] = chunk["answer_text"]
             sources.append(src)
 
-        # Log interaction (fire-and-forget, don't block response)
+        # 记录互动（flush 拿到 interaction_id，随 done 事件返回前端，用于打分反馈→学情）
         user_id = current_user.get("user_id") or current_user.get("id")
-
-        # Schedule interaction logging — runs after streaming without blocking
-        asyncio.ensure_future(_log_interaction(user_id, question, sources))
+        interaction_id = None
+        try:
+            log = InteractionLog(
+                user_id=user_id,
+                question=question[:500],
+                matched_kps=matched_kps,
+            )
+            db.add(log)
+            await db.flush()
+            interaction_id = log.id
+        except Exception as e:
+            logger.warning("Failed to log interaction: %s", e)
 
         def stream_gen():
             try:
@@ -427,13 +459,14 @@ async def chat_stream(
                     llm_context = [web_context_item] + llm_context
                 for kind, text in llm.get_stream_response(
                     query=final_question, context=llm_context,
+                    system_prompt=system_prompt,
                     history=chat_history, deep_think=deep_think,
                 ):
                     if text:
                         yield json.dumps({"type": kind, "content": text}, ensure_ascii=False) + "\n\n"
                 # Sources at the end — avoid blocking content with large JSON
                 yield json.dumps({"type": "sources", "sources": sources, "web_sources": web_sources}, ensure_ascii=False) + "\n\n"
-                yield json.dumps({"type": "done"}, ensure_ascii=False) + "\n\n"
+                yield json.dumps({"type": "done", "interaction_id": interaction_id}, ensure_ascii=False) + "\n\n"
             except Exception as e:
                 yield json.dumps({"type": "error", "content": str(e)}, ensure_ascii=False) + "\n\n"
 
@@ -461,7 +494,7 @@ async def generate_topic(
         "请用5-10个汉字概括这段对话的主题，只输出主题，不要标点符号和其他内容。"
     )
     try:
-        result = llm.get_sync_response(prompt, max_tokens=20)
+        result = await asyncio.to_thread(llm.get_sync_response, prompt, max_tokens=20)
         topic = result.strip().replace('"', '').replace('"', '').replace('"', '')
         return {"topic": topic[:20]}
     except Exception as e:
@@ -469,21 +502,31 @@ async def generate_topic(
         return {"topic": question[:20]}
 
 
-async def _log_interaction(user_id: int, question: str, sources: list):
-    """Log a Q&A interaction asynchronously (own DB session)."""
-    try:
-        from app.core.database import async_session_factory
-        async with async_session_factory() as db2:
-            chapter_ids = list(set(
-                s.get("chapter", "") for s in sources if s.get("chapter")
-            ))
-            log = InteractionLog(
-                user_id=user_id,
-                question=question[:500],
-                matched_kps={"chapters": chapter_ids, "count": len(sources)},
-            )
-            db2.add(log)
-            await db2.commit()
-            logger.info("Interaction logged: user=%d", user_id)
-    except Exception as e:
-        logger.warning("Failed to log interaction: %s", e)
+class FeedbackRequest(BaseModel):
+    feedback: str | None = None  # helpful | not_helpful | None(取消)
+
+
+@router.post("/interactions/{interaction_id}/feedback")
+async def rate_interaction(
+    interaction_id: int,
+    body: FeedbackRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """学生对某次答疑打「有帮助/没帮助」；再点一次相同反馈则取消（写 None）。"""
+    log = (await db.execute(
+        select(InteractionLog).where(InteractionLog.id == interaction_id)
+    )).scalar_one_or_none()
+    if not log:
+        raise HTTPException(404, "互动记录不存在")
+    if log.user_id != current_user["user_id"]:
+        raise HTTPException(403, "无权操作该记录")
+    if body.feedback not in (None, "helpful", "not_helpful"):
+        raise HTTPException(400, "无效反馈")
+    log.feedback = body.feedback
+    await db.commit()
+    return {
+        "message": "反馈已记录" if body.feedback else "反馈已取消",
+        "interaction_id": interaction_id,
+        "feedback": body.feedback,
+    }

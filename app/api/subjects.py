@@ -1,4 +1,6 @@
 """Subject management API — CRUD for academic subjects."""
+import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -24,6 +26,56 @@ class SubjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
 
+class SubjectQuestionsUpdate(BaseModel):
+    questions: list[str]
+
+
+def _parse_questions(raw: str | None) -> list[str]:
+    """把数据库里的 JSON 字符串解析成问题列表。"""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return [str(q).strip() for q in data if str(q).strip()]
+    except Exception:
+        return []
+
+
+def _subject_out(s: Subject) -> dict:
+    return {
+        "id": s.id,
+        "name": s.name,
+        "description": s.description,
+        "example_questions": _parse_questions(s.example_questions),
+        "is_active": s.is_active,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    }
+
+
+async def _generate_questions(name: str) -> list[str]:
+    """用 LLM 为学科生成欢迎页示例问题（创建学科时一次性生成）。"""
+    from app.services.llm_service import LLMService
+
+    prompt = (
+        f"你是一名数学教材编辑。请为「{name}」这门课程设计 4 个典型问题，"
+        "作为答疑助手欢迎页的示例问题。\n"
+        "要求：\n"
+        "1. 每个问题一句话，20 字以内；\n"
+        "2. 覆盖该课程最核心、最常见的知识点；\n"
+        "3. 严格只输出 JSON 数组，例如 [\"问题1\",\"问题2\",\"问题3\",\"问题4\"]，不要输出其它内容。"
+    )
+    try:
+        llm = LLMService()
+        text = await asyncio.to_thread(llm.get_sync_response, prompt, 300, 0.3)
+        s = text.find("[")
+        e = text.rfind("]")
+        if s != -1 and e != -1 and e > s:
+            arr = json.loads(text[s:e + 1])
+            return [str(q).strip() for q in arr if str(q).strip()][:4]
+    except Exception as ex:
+        logger.warning("为学科「%s」生成示例问题失败: %s", name, ex)
+    return []
+
 
 @router.get("/")
 async def list_subjects(
@@ -33,8 +85,7 @@ async def list_subjects(
     """List all active subjects."""
     result = await db.execute(select(Subject).where(Subject.is_active == True).order_by(Subject.name))
     subjects = result.scalars().all()
-    return [{"id": s.id, "name": s.name, "description": s.description, "is_active": s.is_active,
-             "created_at": s.created_at.isoformat() if s.created_at else None} for s in subjects]
+    return [_subject_out(s) for s in subjects]
 
 
 @router.post("/")
@@ -49,14 +100,19 @@ async def create_subject(
         if not existing.is_active:
             existing.is_active = True
             await db.commit()
-            return {"id": existing.id, "name": existing.name, "message": "学科已恢复"}
+            return {**_subject_out(existing), "message": "学科已恢复"}
         raise HTTPException(409, "学科已存在")
 
-    subject = Subject(name=data.name, description=data.description)
+    questions = await _generate_questions(data.name)
+    subject = Subject(
+        name=data.name,
+        description=data.description,
+        example_questions=json.dumps(questions, ensure_ascii=False) if questions else None,
+    )
     db.add(subject)
     await db.commit()
     await db.refresh(subject)
-    return {"id": subject.id, "name": subject.name, "description": subject.description}
+    return _subject_out(subject)
 
 
 @router.put("/{subject_id}")
@@ -76,6 +132,23 @@ async def update_subject(
         subject.description = data.description
     await db.commit()
     return {"message": "学科已更新", "id": subject_id}
+
+
+@router.put("/{subject_id}/questions")
+async def update_subject_questions(
+    subject_id: int,
+    data: SubjectQuestionsUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_admin_user),
+):
+    """更新学科的欢迎页示例问题（管理员）。"""
+    subject = (await db.execute(select(Subject).where(Subject.id == subject_id))).scalar_one_or_none()
+    if not subject:
+        raise HTTPException(404, "学科不存在")
+    questions = [q.strip() for q in data.questions if q.strip()]
+    subject.example_questions = json.dumps(questions, ensure_ascii=False) if questions else None
+    await db.commit()
+    return {"message": "示例问题已更新", "example_questions": questions}
 
 
 @router.delete("/{subject_id}")

@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user, get_teacher_or_admin
-from app.models import Document, Subject, DocumentSubject, User, QuestionBank, KnowledgePoint
+from app.models import Document, Subject, DocumentSubject, User, KnowledgePoint
 from app.services.document_processor import DocumentProcessor
 from app.services.rag_service import RAGService
 
@@ -55,6 +55,21 @@ def _append_log(doc_id: int, msg: str):
         pass
 
 
+def _kill_mineru_api_server():
+    """终止常驻 mineru-api 服务（端口 8002），停止其 GPU 任务。"""
+    import subprocess
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True).stdout
+        for line in out.split("\n"):
+            if ":8002" in line and "LISTENING" in line:
+                pid = line.strip().split()[-1]
+                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                logger.info("已终止 mineru-api 服务 (PID %s)", pid)
+                return
+    except Exception as e:
+        logger.warning("终止 mineru-api 失败: %s", e)
+
+
 async def process_document_task(doc_id: int, pdf_path: Path):
     """Background task: MinerU parse → knowledge tree → FAISS index build.
 
@@ -88,7 +103,7 @@ async def process_document_task(doc_id: int, pdf_path: Path):
     if _is_cancelled():
         _append_log(doc_id, "🛑 任务被取消")
         return
-    _append_log(doc_id, "⏳ 正在将答疑模型移出 GPU...")
+    _append_log(doc_id, "⏳ 开始 MinerU 解析（独立子进程懒加载模型，RAG 模型常驻 GPU 不受影响）...")
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(None, _run_mineru_blocking, pdf_path, doc_id)
@@ -123,42 +138,40 @@ async def process_document_task(doc_id: int, pdf_path: Path):
                 doc.total_pages = result.get("total_pages", 0)
                 doc.progress = 33
                 await db.commit()
-            _append_log(doc_id, "状态: parsed (33%) — 构建知识树...")
+            _append_log(doc_id, "状态: parsed (33%) — 自动切块...")
+            # 自动切块：按滑动窗口切成扁平分块（学科在构建时通过 document_subjects 归集）
             try:
-                from app.services.knowledge_tree_service import KnowledgeTreeService
-                from app.services.llm_service import LLMService
-                kts = KnowledgeTreeService()
-                _append_log(doc_id, "🔍 规则引擎结构化...")
-                kt_result = await kts.build_from_parsed(doc_id, result, db)
+                from app.models import DocumentSubject
+                sids = (await db.execute(
+                    select(DocumentSubject.subject_id).where(DocumentSubject.document_id == doc_id)
+                )).scalars().all()
+                sid = sids[0] if sids else None
+                chunk_count = await RAGService._ingest_document_chunks(db, doc_id, sid)
                 await db.commit()
-
-                _append_log(doc_id, "🤖 调用 LLM 生成知识点摘要...")
-                llm = LLMService()
-                await kts.generate_kp_summaries(db, llm)
-                await db.commit()
-                logger.info("Knowledge tree built for doc %d: %s", doc_id, kt_result)
-                _append_log(doc_id, f"✅ 知识树构建完成: {kt_result}")
+                _append_log(doc_id, f"✅ 自动切块完成: {chunk_count} 块")
             except Exception as e:
-                logger.warning("Knowledge tree build failed (non-fatal): %s", e)
-                _append_log(doc_id, f"⚠️ 知识树构建失败 (非致命): {e}")
+                logger.warning("Auto chunking failed (non-fatal): %s", e)
+                _append_log(doc_id, f"⚠️ 自动切块失败 (非致命): {e}")
 
-            doc = (await db.execute(select(Document).where(Document.id == doc_id))).scalar_one_or_none()
-            if doc:
-                doc.progress = 66
-                await db.commit()
-            _append_log(doc_id, "状态: 66% — 构建 FAISS 索引...")
-
-            # Step 3: Build FAISS indices
+            # 自动抽题：把解析结果里的题目抽取进独立试题库（各学科 in_qb 的书籍）
             try:
-                _append_log(doc_id, "📊 正在移动模型到 GPU 并构建向量索引...")
-                rag = RAGService()
-                rag.build_index(doc_id)
-                await rag.build_knowledge_indices(doc_id)
-                logger.info("RAG indices built for doc %d", doc_id)
-                _append_log(doc_id, "✅ FAISS 索引构建完成")
+                from app.models import DocumentSubject
+                from app.services.question_extractor import extract_questions_to_bank
+                qb_rows = (await db.execute(
+                    select(DocumentSubject).where(
+                        DocumentSubject.document_id == doc_id,
+                        DocumentSubject.in_qb.is_(True),
+                    )
+                )).scalars().all()
+                total_q = 0
+                for r in qb_rows:
+                    res = await extract_questions_to_bank(db, doc_id, r.subject_id, chapter_override=r.qb_chapter)
+                    total_q += res.get("extracted", 0)
+                await db.commit()
+                _append_log(doc_id, f"✅ 自动抽题完成: {total_q} 题")
             except Exception as e:
-                logger.warning("RAG index build failed: %s", e)
-                _append_log(doc_id, f"⚠️ 索引构建失败: {e}")
+                logger.warning("Auto question extraction failed (non-fatal): %s", e)
+                _append_log(doc_id, f"⚠️ 自动抽题失败 (非致命): {e}")
 
             doc = (await db.execute(select(Document).where(Document.id == doc_id))).scalar_one_or_none()
             if doc:
@@ -198,9 +211,13 @@ async def upload_document(
     pdf_dir.mkdir(parents=True, exist_ok=True)
     save_path = pdf_dir / f"{file_id}.pdf"
 
-    content = await file.read()
+    # 流式写盘：分块读取，避免整文件读入内存（大文件更稳更快）
     with open(save_path, "wb") as f:
-        f.write(content)
+        while True:
+            chunk = await file.read(1024 * 1024)  # 1MB/块
+            if not chunk:
+                break
+            f.write(chunk)
 
     doc = Document(
         title=title or file.filename,
@@ -239,7 +256,7 @@ async def list_documents(
     current_user: dict = Depends(get_teacher_or_admin),
 ):
     """List all documents, optionally filtered by subject."""
-    query = select(Document).order_by(Document.created_at.desc())
+    query = select(Document).order_by(Document.id.asc())
     if subject_id:
         query = query.join(DocumentSubject).where(DocumentSubject.subject_id == subject_id)
     result = await db.execute(query)
@@ -310,274 +327,69 @@ async def serve_pdf(
                         headers={"Content-Disposition": "inline; filename=\"textbook.pdf\""})
 
 
-# ── QuestionBanks ──
-
-@router.get("/exercises")
-async def list_exercises(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    kp_id: str | None = None,
-    source: str | None = None,
-    question_type: str | None = None,
-    difficulty: int | None = None,
-    has_answer: bool | None = None,
+@router.get("/library-membership")
+async def get_library_membership(
     db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
 ):
-    """List exercises with optional filters."""
-    conditions = []
-    if kp_id:
-        conditions.append(QuestionBank.kp_id == kp_id)
-    if source:
-        conditions.append(QuestionBank.source == source)
-    if question_type:
-        conditions.append(QuestionBank.question_type == question_type)
-    if difficulty:
-        conditions.append(QuestionBank.difficulty == difficulty)
-    if has_answer is True:
-        conditions.append(QuestionBank.answer_text.isnot(None))
-        conditions.append(QuestionBank.answer_text != "")
-    elif has_answer is False:
-        conditions.append(or_(QuestionBank.answer_text.is_(None), QuestionBank.answer_text == ""))
-
-    base = select(QuestionBank)
-    if conditions:
-        base = base.where(and_(*conditions))
-
-    total = await db.scalar(select(func.count()).select_from(base.subquery()))
-    offset = (page - 1) * page_size
-    result = await db.execute(
-        base.order_by(QuestionBank.id.desc()).offset(offset).limit(page_size)
-    )
-    exercises = result.scalars().all()
-
-    # Load document titles for exercises with source_doc_id
-    doc_ids = list(set(e.source_doc_id for e in exercises if e.source_doc_id))
-    doc_titles = {}
-    if doc_ids:
-        doc_result = await db.execute(select(Document.id, Document.title).where(Document.id.in_(doc_ids)))
-        doc_titles = {d[0]: d[1] for d in doc_result.all()}
-
-    return {
-        "data": [
-            {
-                "id": e.id, "kp_id": e.kp_id, "question_text": e.question_text,
-                "answer_text": e.answer_text, "question_type": e.question_type,
-                "difficulty": e.difficulty, "source": e.source,
-                "page_number": e.page_number,
-                "source_doc_id": e.source_doc_id,
-                "source_doc_title": doc_titles.get(e.source_doc_id, ""),
-                "created_at": e.created_at.isoformat() if e.created_at else None,
-            }
-            for e in exercises
-        ],
-        "total": total or 0, "page": page, "page_size": page_size,
-    }
+    """返回所有 (文档, 学科) 的知识库/题库归属，供向量库管理使用。"""
+    from app.models import DocumentSubject
+    rows = (await db.execute(select(DocumentSubject))).scalars().all()
+    return [
+        {"document_id": r.document_id, "subject_id": r.subject_id,
+         "in_kb": bool(r.in_kb), "in_qb": bool(r.in_qb),
+         "qb_chapter": r.qb_chapter}
+        for r in rows
+    ]
 
 
-@router.get("/exercises/stats")
-async def get_exercise_stats(db: AsyncSession = Depends(get_db)):
-    """Get exercise statistics."""
-    total = await db.scalar(select(func.count(QuestionBank.id)))
-    textbook = await db.scalar(select(func.count(QuestionBank.id)).where(QuestionBank.source == "textbook"))
-    teacher = await db.scalar(select(func.count(QuestionBank.id)).where(QuestionBank.source == "teacher"))
-    choice = await db.scalar(select(func.count(QuestionBank.id)).where(QuestionBank.question_type == "choice"))
-    calc = await db.scalar(select(func.count(QuestionBank.id)).where(QuestionBank.question_type.in_(["calculation", "proof"])))
-    with_answer = await db.scalar(
-        select(func.count(QuestionBank.id)).where(
-            and_(QuestionBank.answer_text.isnot(None), QuestionBank.answer_text != "")
+class LibraryMembershipUpdate(BaseModel):
+    subject_id: int
+    in_kb: bool = True
+    in_qb: bool = True
+    qb_chapter: str | None = None   # 抽题指定章（无结构纯题目列表时）
+
+
+@router.put("/{doc_id}/library")
+async def set_library_membership(
+    doc_id: int,
+    data: LibraryMembershipUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """设置某文档在某学科的知识库/题库归属；两者都 False 则移除。"""
+    from app.models import DocumentSubject
+    existing = await db.scalar(
+        select(DocumentSubject).where(
+            DocumentSubject.document_id == doc_id,
+            DocumentSubject.subject_id == data.subject_id,
         )
     )
-
-    return {
-        "total": total or 0,
-        "textbook": textbook or 0,
-        "teacher": teacher or 0,
-        "choice": choice or 0,
-        "calculation_proof": calc or 0,
-        "with_answer": with_answer or 0,
-    }
-
-
-@router.get("/exercises/{exercise_id}")
-async def get_exercise_detail(
-    exercise_id: int,
-    db: AsyncSession = Depends(get_db),
-):
-    """Get single exercise with full details."""
-    result = await db.execute(select(QuestionBank).where(QuestionBank.id == exercise_id))
-    e = result.scalar_one_or_none()
-    if not e:
-        raise HTTPException(404, "习题不存在")
-
-    doc_title = ""
-    if e.source_doc_id:
-        doc_result = await db.execute(select(Document.title).where(Document.id == e.source_doc_id))
-        doc_title = doc_result.scalar_one_or_none() or ""
-
-    return {
-        "id": e.id, "kp_id": e.kp_id, "question_text": e.question_text,
-        "answer_text": e.answer_text, "question_type": e.question_type,
-        "difficulty": e.difficulty, "source": e.source,
-        "page_number": e.page_number,
-        "source_doc_id": e.source_doc_id,
-        "source_doc_title": doc_title,
-        "images": e.images,
-        "embedding_text": e.embedding_text,
-        "verified": e.verified,
-        "created_at": e.created_at.isoformat() if e.created_at else None,
-    }
-
-
-# ── QuestionBank CRUD ──
-
-class QuestionBankCreateBody(BaseModel):
-    kp_id: str | None = None
-    chapter: str | None = None
-    question_text: str
-    answer_text: str | None = None
-    question_type: str = "calculation"
-    difficulty: int = 3
-    page_number: int | None = None
-    subject_id: int | None = None
-    images: list[dict] | None = None
-
-
-class QuestionBankUpdateBody(BaseModel):
-    kp_id: str | None = None
-    question_text: str | None = None
-    answer_text: str | None = None
-    question_type: str | None = None
-    difficulty: int | None = None
-    page_number: int | None = None
-    images: list[dict] | None = None
-    verified: bool | None = None
-
-
-@router.post("/exercises")
-async def create_exercise(
-    data: QuestionBankCreateBody,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_teacher_or_admin),
-):
-    """Manually create an exercise (teacher/admin)."""
-    from app.services.vlm_service import VLMService
-    # Process images with VLM if any
-    images = data.images or []
-    embedding_parts = [data.question_text]
-    if images:
-        vlm = VLMService()
-        for img in images:
-            path = img.get("path", "")
-            if path and Path(path).exists():
-                result = vlm.process_image(path)
-                img["vlm_desc"] = result.get("description")
-                if result.get("usable"):
-                    embedding_parts.append(result["description"])
-
-    # 章节：优先用前端传的 chapter，否则从 kp_id 反推
-    chapter = data.chapter
-    if not chapter and data.kp_id:
-        kp = await db.get(KnowledgePoint, data.kp_id)
-        if kp and kp.chapter:
-            chapter = kp.chapter
-
-    ex = QuestionBank(
-        kp_id=data.kp_id,
-        chapter=chapter,
-        question_text=data.question_text,
-        answer_text=data.answer_text,
-        question_type=data.question_type,
-        difficulty=data.difficulty,
-        page_number=data.page_number,
-        subject_id=data.subject_id or 9,
-        source="teacher",
-        images=images if images else None,
-        embedding_text="\n".join(embedding_parts),
-    )
-    db.add(ex)
+    if existing:
+        if not data.in_kb and not data.in_qb:
+            await db.delete(existing)
+        else:
+            existing.in_kb = data.in_kb
+            existing.in_qb = data.in_qb
+            existing.qb_chapter = data.qb_chapter
+    elif data.in_kb or data.in_qb:
+        db.add(DocumentSubject(
+            document_id=doc_id, subject_id=data.subject_id,
+            in_kb=data.in_kb, in_qb=data.in_qb, qb_chapter=data.qb_chapter,
+        ))
     await db.commit()
-    await db.refresh(ex)
-    return {"id": ex.id, "message": "习题已创建"}
 
+    # 设为题库材料后，立即从解析结果抽取题目（题解分离 + 章/节对应）
+    if data.in_qb:
+        try:
+            from app.services.question_extractor import extract_questions_to_bank
+            res = await extract_questions_to_bank(db, doc_id, data.subject_id, chapter_override=data.qb_chapter)
+            await db.commit()
+            return {"message": f"已更新，抽取题目 {res.get('extracted', 0)} 道"}
+        except Exception as e:
+            logger.warning("设为题库后自动抽题失败 (doc=%d): %s", doc_id, e)
 
-@router.put("/exercises/{exercise_id}")
-async def update_exercise(
-    exercise_id: int,
-    data: QuestionBankUpdateBody,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_teacher_or_admin),
-):
-    """Update an exercise (teacher/admin)."""
-    result = await db.execute(select(QuestionBank).where(QuestionBank.id == exercise_id))
-    ex = result.scalar_one_or_none()
-    if not ex:
-        raise HTTPException(404, "习题不存在")
-
-    if data.kp_id is not None: ex.kp_id = data.kp_id
-    if data.question_text is not None: ex.question_text = data.question_text
-    if data.answer_text is not None: ex.answer_text = data.answer_text
-    if data.question_type is not None: ex.question_type = data.question_type
-    if data.difficulty is not None: ex.difficulty = data.difficulty
-    if data.page_number is not None: ex.page_number = data.page_number
-    if data.images is not None: ex.images = data.images
-    if data.verified is not None: ex.verified = data.verified
-    # Rebuild embedding_text if question or images changed
-    if data.question_text is not None or data.images is not None:
-        parts = [ex.question_text]
-        if ex.images:
-            for img in ex.images:
-                if img.get("vlm_desc"):
-                    parts.append(img["vlm_desc"])
-        ex.embedding_text = "\n".join(parts)
-
-    await db.commit()
-    return {"id": ex.id, "message": "习题已更新"}
-
-
-@router.delete("/exercises/{exercise_id}")
-async def delete_exercise(
-    exercise_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_teacher_or_admin),
-):
-    """Hard delete an exercise (teacher/admin)."""
-    result = await db.execute(select(QuestionBank).where(QuestionBank.id == exercise_id))
-    ex = result.scalar_one_or_none()
-    if not ex:
-        raise HTTPException(404, "习题不存在")
-
-    await db.delete(ex)
-    await db.commit()
-    return {"message": "习题已删除"}
-
-
-@router.post("/exercises/upload-image")
-async def upload_exercise_image(
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_teacher_or_admin),
-):
-    """Upload an image for an exercise. Returns the path and VLM description."""
-    upload_dir = Path(settings.DATA_DIR) / "exercise_images"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    ext = Path(file.filename).suffix if file.filename else ".png"
-    filename = f"{uuid.uuid4().hex}{ext}"
-    filepath = upload_dir / filename
-
-    content = await file.read()
-    with open(filepath, "wb") as f:
-        f.write(content)
-
-    # Run VLM
-    from app.services.vlm_service import VLMService
-    vlm = VLMService()
-    vr = vlm.process_image(str(filepath))
-
-    return {
-        "path": str(filepath),
-        "type": vr["type"],
-        "vlm_desc": vr.get("description"),
-        "usable": vr.get("usable", False),
-    }
+    return {"message": "已更新"}
 
 
 @router.get("/{doc_id}")
@@ -609,6 +421,29 @@ async def get_parsed_result(doc_id: int, db: AsyncSession = Depends(get_db),
         return {"status": doc.status, "message": "文档处理失败"}
     result = processor.get_parsed_result(doc_id)
     return {"status": doc.status, "data": result}
+
+
+@router.put("/{doc_id}/parsed/markdown")
+async def update_parsed_markdown(doc_id: int, body: dict, db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin)):
+    """保存解析校对后的 Markdown 内容（写回 result.json）。"""
+    doc = (await db.execute(select(Document).where(Document.id == doc_id))).scalar_one_or_none()
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+    markdown = body.get("markdown")
+    if markdown is None:
+        raise HTTPException(400, "缺少 markdown 字段")
+
+    result_file = DATA_DIR / "parsed" / str(doc_id) / "result.json"
+    if not result_file.exists():
+        raise HTTPException(404, "解析结果不存在")
+    try:
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    data["markdown"] = markdown
+    result_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"message": "已保存", "doc_id": doc_id}
 
 
 @router.get("/{doc_id}/page/{page_num}")
@@ -650,11 +485,27 @@ async def delete_document(doc_id: int, db: AsyncSession = Depends(get_db),
     if not doc:
         raise HTTPException(404, "文档不存在")
 
-    # Signal any running background task to stop
+    from app.models import ContentChunk, DocumentSubject
+    from sqlalchemy import delete as sa_delete
+
+    # 1. 记录该文档所属学科（删除后需重建这些学科的知识库/题库）
+    subj_rows = await db.execute(
+        select(DocumentSubject.subject_id).where(DocumentSubject.document_id == doc_id)
+    )
+    subject_ids = [r[0] for r in subj_rows.all()]
+
+    # 2. Signal any running background task to stop
     _cancelled_docs.add(doc_id)
     logger.info("🛑 取消文档 %d 的后台解析任务", doc_id)
+    from app.services.document_processor import cancel_mineru_process
+    cancel_mineru_process(doc_id)
+    _kill_mineru_api_server()
 
-    # Delete original PDF
+    # 3. 删除该文档衍生的知识库/题库/习题数据（删除 = 废弃）
+    await db.execute(sa_delete(ContentChunk).where(ContentChunk.source_doc_id == doc_id))
+    await db.execute(sa_delete(DocumentSubject).where(DocumentSubject.document_id == doc_id))
+
+    # 4. Delete original PDF + parsed output directory
     try:
         pdf_path = Path(doc.file_path)
         if pdf_path.exists():
@@ -662,7 +513,6 @@ async def delete_document(doc_id: int, db: AsyncSession = Depends(get_db),
     except Exception as e:
         logger.warning("删除 PDF 文件失败: %s", e)
 
-    # Delete parsed output directory
     parsed_dir = DATA_DIR / "parsed" / str(doc_id)
     if parsed_dir.exists():
         try:
@@ -670,18 +520,41 @@ async def delete_document(doc_id: int, db: AsyncSession = Depends(get_db),
         except Exception as e:
             logger.warning("删除解析目录失败: %s", e)
 
-    # Delete FAISS index files
-    vector_dir = DATA_DIR / "vector_store"
-    if vector_dir.exists():
-        for idx_file in vector_dir.glob(f"*{doc_id}*"):
-            try:
-                idx_file.unlink()
-            except Exception:
-                pass
-
     await db.delete(doc)
     await db.commit()
-    return {"message": "文档已删除，解析任务已取消"}
+
+    # 5. 重建相关学科的知识库 + 题库索引（删除文档后内容已废弃）
+    from app.services.rag_service import RAGService
+    from app.services.gpu_manager import gpu_manager
+    rag = RAGService()
+    gpu_manager.to_gpu("embedding")  # 构建索引需要 embedding 在 GPU；clear_gpu 会把它挪到 CPU 导致跑满 CPU
+    try:
+        for sid in subject_ids:
+            await rag.build_chunk_index(sid, db=db)
+    finally:
+        gpu_manager.restore_defaults()
+
+    return {"message": "文档已删除，相关知识库/题库已重建", "rebuilt_subjects": subject_ids}
+
+
+@router.post("/{doc_id}/cancel")
+async def cancel_document(
+    doc_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_teacher_or_admin),
+):
+    """取消文档解析：停止后台任务，标记为 cancelled。"""
+    doc = (await db.execute(select(Document).where(Document.id == doc_id))).scalar_one_or_none()
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+    _cancelled_docs.add(doc_id)
+    from app.services.document_processor import cancel_mineru_process
+    cancel_mineru_process(doc_id)
+    _kill_mineru_api_server()
+    doc.status = "cancelled"
+    doc.progress = 0
+    await db.commit()
+    return {"message": "已取消解析", "doc_id": doc_id}
 
 
 @router.post("/{doc_id}/reparse")
@@ -844,44 +717,24 @@ async def update_document_subjects(
         db.add(DocumentSubject(document_id=doc_id, subject_id=sid))
     await db.commit()
 
-    # Trigger knowledge tree building if subjects assigned and parsed
+    # Trigger knowledge base (content chunks) building if subjects assigned and parsed
     result_msg = "学科分配已更新"
     if data.subject_ids and doc.status == "completed":
         kt_service = KnowledgeTreeService()
-        rag = RAGService()
 
         for sid in data.subject_ids:
             try:
-                # Check if this subject already has any KPs
-                existing_kps = await db.execute(
-                    select(KnowledgePoint).limit(1)
-                )
-                has_kps = existing_kps.scalar_one_or_none() is not None
-
+                # 知识树已改为手动构建，这里只生成内容块（知识库，供答疑检索）
                 build_result = await kt_service.build_from_content_list(
                     doc_id=doc_id,
                     subject_id=sid,
                     db=db,
-                    is_primary=not has_kps,
+                    is_primary=True,
                 )
 
-                # Generate LLM summaries for newly created KPs (primary build only)
-                if not has_kps and build_result.get("knowledge_points", 0) > 0:
-                    try:
-                        from app.services.llm_service import LLMService
-                        llm = LLMService()
-                        summary_count = await kt_service.generate_kp_summaries(db, llm_service=llm)
-                        logger.info("Generated %d KP summaries for subject %d", len(summary_count), sid)
-                    except Exception as e:
-                        logger.warning("KP摘要生成跳过（LLM不可用）: %s", e)
-
-                # Build/rebuild FAISS indices for this subject
-                # FAISS built in background to avoid blocking
-                logger.info("FAISS will be built in background for subject %d", sid)
-
-                result_msg += f" | 学科{sid}: 构建{'主' if not has_kps else '补充'} {build_result['knowledge_points']}KP {build_result['content_chunks']}块 {build_result['exercises']}题"
+                result_msg += f" | 学科{sid}: {build_result['content_chunks']}块"
             except Exception as e:
-                logger.error("知识树构建失败 (doc=%d, subject=%d): %s", doc_id, sid, e)
+                logger.error("知识库构建失败 (doc=%d, subject=%d): %s", doc_id, sid, e)
 
     return {"message": result_msg, "subject_ids": data.subject_ids}
 

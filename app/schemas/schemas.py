@@ -26,7 +26,7 @@ class RefreshRequest(BaseModel):
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=2, max_length=50)
     password: str = Field(..., min_length=6)
-    real_name: str = Field(default="", max_length=50)
+    real_name: str = Field(..., min_length=1, max_length=50)
     role: str = Field(default="student", pattern="^(student|teacher|admin)$")
     class_name: str | None = None
     student_id: str | None = None
@@ -83,6 +83,7 @@ class KPNodeBase(BaseModel):
     chapter: str | None = None
     level: int = 0
     sort_order: int = 0
+    subject_id: int | None = None
 
 
 class KPNodeCreate(KPNodeBase):
@@ -123,6 +124,7 @@ class ExerciseCreate(BaseModel):
     difficulty: int = Field(default=3, ge=1, le=5)
     source: str = "teacher"
     page_number: int | None = None
+    subject_id: int | None = None
 
 
 class ExerciseOut(BaseModel):
@@ -135,6 +137,7 @@ class ExerciseOut(BaseModel):
     source: str
     page_number: int | None = None
     faiss_id: int | None = None
+    subject_id: int | None = None
 
     model_config = {"from_attributes": True}
 
